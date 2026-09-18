@@ -1,0 +1,539 @@
+from models.superadmin_models import (
+	Login,
+	PasswordResetConfirm,
+	PasswordResetRequest,
+	SuperAdmin,
+	UpdateSuperAdmin,
+	VerifyOTP,
+)
+from config.db_collections import institutions_collection, superadmin_collection, students_collections
+from utils.generate_ids import generate_id
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
+import secrets
+from schemas.superadmin_schemas import single_document
+from schemas.institutions_schemas import get_all_documents, get_single_document
+from schemas.admin_schemas import get_all_admin_doc, single_admin_doc
+from services.email_service import admin_account_created, superadmin_account_verify, superadmin_password_reset
+from utils.jwt_token_auth import create_access_token, get_current_superadmin
+from models.institutions_model import UpdateBase
+from config.db_collections import admins_collection
+from models.admin_model import Admin, UpdateAdmin
+from models.students_models import UpdateStudents
+from schemas.students_schemas import get_all_documents as get_all_student_documents, get_single_document as get_single_student_document
+from routers.students_router import upload_students
+
+superadmin_router=APIRouter(prefix="/superadmin",tags=["Super Admin"])
+
+
+def _internal_server_error(error: Exception) -> HTTPException:
+	return HTTPException(
+		status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+		detail="Unable to process superadmin request",
+	)
+
+
+def _as_aware_utc(value: datetime | None) -> datetime | None:
+	if value is None:
+		return None
+	if value.tzinfo is None:
+		return value.replace(tzinfo=timezone.utc)
+	return value
+
+
+@superadmin_router.post("/register")
+async def register(requests:SuperAdmin):
+    try:
+        document=requests.model_dump()
+        superadmin_unique_id=generate_id(7)
+        payload={
+            "superadmin_id":str(uuid4()),
+            "unique_id":superadmin_unique_id,
+            "fullname":document.get("fullname"),
+            "email":document.get("email"),
+            "mobilenumber":document.get("mobilenumber"),
+            "password":document.get("password"),
+            "otp_code": f"{secrets.randbelow(1_000_000):06d}",
+            "otp_expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+            "otp_verified":False,
+            "role":"superadmin"
+
+        }
+        await superadmin_collection.insert_one(payload)
+        await superadmin_account_verify(payload["email"], payload["otp_code"])
+        return {"message": "Superadmin registered. Verification OTP sent."}
+    except Exception as error:
+        raise HTTPException(status_code=500, detail="Unable to register superadmin") from error
+    
+    
+@superadmin_router.post("/login")
+async def login_institution(credentials: Login):
+	try:
+		document = await superadmin_collection.find_one({"email": str(credentials.email)})
+		if document is None or credentials.password != document.get("password"):
+			raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+		if not document.get("otp_verified", False):
+			raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Email OTP verification required")
+
+		token = create_access_token(
+			user_id=document["superadmin_id"],
+			role="superadmin",
+			organization_id=document["superadmin_id"],
+			email=document["email"],
+		)
+		return {
+			"access_token": token,
+			"token_type": "bearer",
+		} 
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise HTTPException(status_code=500, detail=str(error))
+    
+    
+@superadmin_router.post("/verify-otp")
+async def verify_otp(payload: VerifyOTP):
+	try:
+		document = await superadmin_collection.find_one({"email": str(payload.email)})
+		if document is None:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Superadmin not found")
+		if document.get("otp_verified", False):
+			return single_document(document)
+		if document.get("otp_code") != payload.otp:
+			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid OTP")
+		expires_at = _as_aware_utc(document.get("otp_expires_at"))
+		if expires_at is None or expires_at < datetime.now(timezone.utc):
+			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="OTP has expired")
+
+		await superadmin_collection.update_one(
+			{"email": str(payload.email)},
+			{"$set": {"otp_verified": True}, "$unset": {"otp_code": "", "otp_expires_at": ""}},
+		)
+		document["otp_verified"] = True
+		return single_document(document)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise HTTPException(status_code=500, detail=str(error))
+
+
+
+@superadmin_router.post("/password-reset/request")
+async def request_password_reset(payload: PasswordResetRequest):
+	try:
+		document = await superadmin_collection.find_one({"email": str(payload.email)})
+		if document is None:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Superadmin not found")
+		if not document.get("otp_verified", False):
+			raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Email OTP verification required")
+
+		otp = f"{secrets.randbelow(1_000_000):06d}"
+		expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+		await superadmin_collection.update_one(
+			{"superadmin_id": document["superadmin_id"]},
+			{"$set": {"password_reset_otp": otp, "password_reset_expires_at": expires_at}},
+		)
+		await superadmin_password_reset(str(payload.email), otp)
+		return {"message": "Password reset OTP sent"}
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Unable to process password reset request",
+		) from error
+
+
+@superadmin_router.post("/password-reset/confirm")
+async def confirm_password_reset(payload: PasswordResetConfirm):
+	try:
+		document = await superadmin_collection.find_one({"email": str(payload.email)})
+		if document is None:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Superadmin not found")
+		if document.get("password_reset_otp") != payload.otp:
+			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid password reset OTP")
+
+		expires_at = _as_aware_utc(document.get("password_reset_expires_at"))
+		if expires_at is None or expires_at < datetime.now(timezone.utc):
+			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Password reset OTP has expired")
+
+		await superadmin_collection.update_one(
+			{"superadmin_id": document["superadmin_id"]},
+			{
+				"$set": {"password": payload.new_password},
+				"$unset": {"password_reset_otp": "", "password_reset_expires_at": ""},
+			},
+		)
+		return {"message": "Password reset successfully"}
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Unable to confirm password reset",
+		) from error
+  
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#SuperAdmin
+@superadmin_router.get("/superadmin-get-all-institutes")
+async def get_all_institutions(principal: dict = Depends(get_current_superadmin)):
+	try:
+		documents = await institutions_collection.find().to_list(length=None)
+		return get_all_documents(documents)
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.patch("/superadmin-update-institution/{institution_id}")
+async def update_institution(
+	institution_id: str,
+	institution: UpdateBase,
+	principal: dict = Depends(get_current_superadmin),
+):
+	try:
+		updates = institution.model_dump(exclude_unset=True)
+		if not updates:
+			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one field is required")
+
+		result = await institutions_collection.update_one(
+			{"institution_id": institution_id},
+			{"$set": updates},
+		)
+		if result.matched_count == 0:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Institution not found")
+
+		document = await institutions_collection.find_one({"institution_id": institution_id})
+		return get_single_document(document)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.delete("/delete-institution/{institution_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_institution(institution_id: str, principal: dict = Depends(get_current_superadmin)):
+	try:
+		result = await institutions_collection.delete_one({"institution_id": institution_id})
+		if result.deleted_count == 0:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Institution not found")
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+#Admin
+
+@superadmin_router.post("/admin-creation")
+async def add_new_admin(requests:Admin, current_superadmin:dict=Depends(get_current_superadmin)):
+	try:
+		document = requests.model_dump()
+		payload = {
+			"admin_id": str(uuid4()),
+			"admin_loginId": document.get("admin_userId"),
+			"admin_name": document.get("admin_name"),
+			"email": document.get("email"),
+			"mobilenumber": document.get("mobilenumber"),
+			"password": document.get("password"),
+			"superadmin_id": current_superadmin["sub"],
+			"role": "admin",
+		}
+		id_acc = await admins_collection.find_one({"admin_loginId": payload["admin_loginId"]})
+		if id_acc:
+			raise HTTPException(status_code=400, detail="Admin login ID already exists")
+		check_acc = await admins_collection.find_one(
+			{"email": payload["email"], "superadmin_id": payload["superadmin_id"]}
+		)
+		if check_acc:
+			raise HTTPException(status_code=400, detail="The email is already registered")
+		await admins_collection.insert_one(payload)
+		await admin_account_created(
+			str(payload["email"]),
+			payload["admin_name"],
+			payload["admin_loginId"],
+			payload["password"],
+		)
+		return {"message": "Admin registration successful"}
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise HTTPException(status_code=500, detail="Unable to create admin account") from error
+
+
+@superadmin_router.get("/admins")
+async def get_all_admins(current_superadmin: dict = Depends(get_current_superadmin)):
+	try:
+		documents = await admins_collection.find(
+			{"superadmin_id": current_superadmin["sub"]}
+		).to_list(length=None)
+		return get_all_admin_doc(documents)
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.patch("/admin/{admin_id}")
+async def update_admin(
+	admin_id: str,
+	admin: UpdateAdmin,
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		updates = admin.model_dump(exclude_unset=True)
+		if not updates:
+			raise HTTPException(
+				status_code=status.HTTP_400_BAD_REQUEST,
+				detail="At least one field is required",
+			)
+
+		if "admin_userId" in updates:
+			updates["admin_loginId"] = updates.pop("admin_userId")
+
+		if "email" in updates:
+			updates["email"] = str(updates["email"])
+
+		if "admin_loginId" in updates:
+			login_id_exists = await admins_collection.find_one(
+				{
+					"admin_loginId": updates["admin_loginId"],
+					"admin_id": {"$ne": admin_id},
+				}
+			)
+			if login_id_exists:
+				raise HTTPException(status_code=400, detail="Admin login ID already exists")
+
+		if "email" in updates:
+			email_exists = await admins_collection.find_one(
+				{
+					"email": updates["email"],
+					"superadmin_id": current_superadmin["sub"],
+					"admin_id": {"$ne": admin_id},
+				}
+			)
+			if email_exists:
+				raise HTTPException(status_code=400, detail="The email is already registered")
+
+		result = await admins_collection.update_one(
+			{"admin_id": admin_id, "superadmin_id": current_superadmin["sub"]},
+			{"$set": updates},
+		)
+		if result.matched_count == 0:
+			raise HTTPException(status_code=404, detail="Admin not found")
+
+		document = await admins_collection.find_one({"admin_id": admin_id})
+		return single_admin_doc(document)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.delete("/admin/{admin_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_admin(
+	admin_id: str,
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		result = await admins_collection.delete_one(
+			{"admin_id": admin_id, "superadmin_id": current_superadmin["sub"]}
+		)
+		if result.deleted_count == 0:
+			raise HTTPException(status_code=404, detail="Admin not found")
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+#------------------------------------------------------------------------------------------------------------------
+#------------------------------------------------------------------------------------------------------------------
+#Students 
+
+@superadmin_router.post("/students/upload", status_code=status.HTTP_201_CREATED)
+async def superadmin_upload_students(
+	excel_file: UploadFile = File(...),
+	certificates: list[UploadFile] = File(default=[]),
+	batch_year: str = Form(...),
+	institution_id: str = Form(...),
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		return await upload_students(
+			excel_file=excel_file,
+			certificates=certificates,
+			batch_year=batch_year,
+			principal={"role": "superadmin", "institution_id": institution_id},
+		)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+def _student_key(value: str) -> str:
+	return " ".join(str(value).strip().upper().split())
+
+
+@superadmin_router.get("/students/institution/{institution_name}")
+async def superadmin_get_students_by_institution(
+	institution_name: str,
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		documents = await students_collections.find({"institution_name": institution_name}).to_list(length=None)
+		return get_all_student_documents(documents)
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.get("/students/institution/{institution_name}/year/{year}")
+async def superadmin_get_students_by_year(
+	institution_name: str,
+	year: int,
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		documents = await students_collections.find(
+			{"institution_name": institution_name, "month_year_pass": {"$regex": str(year)}}
+		).to_list(length=None)
+		return get_all_student_documents(documents)
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.get("/students/institution/{institution_name}/batch/{batch_year}")
+async def superadmin_get_students_by_batch(
+	institution_name: str,
+	batch_year: str,
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		documents = await students_collections.find(
+			{"institution_name": institution_name, "batch_year": _student_key(batch_year)}
+		).to_list(length=None)
+		return get_all_student_documents(documents)
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.get("/students/stats/{institution_id}")
+async def superadmin_get_student_stats(
+	institution_id: str,
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		result = await students_collections.aggregate(
+			[
+				{"$match": {"institution_id": institution_id}},
+				{
+					"$facet": {
+						"total": [{"$count": "count"}],
+						"by_year": [
+							{"$group": {"_id": "$month_year_pass", "count": {"$sum": 1}}},
+							{"$sort": {"_id": 1}},
+						],
+						"by_department": [
+							{"$group": {"_id": "$course_or_Acadamic", "count": {"$sum": 1}}},
+							{"$sort": {"_id": 1}},
+						],
+						"by_grade": [
+							{"$group": {"_id": "$grade", "count": {"$sum": 1}}},
+							{"$sort": {"_id": 1}},
+						],
+						"by_batch_year": [
+							{"$group": {"_id": "$batch_year", "count": {"$sum": 1}}},
+							{"$sort": {"_id": 1}},
+						],
+					}
+				},
+			]
+		).to_list(length=1)
+		facets = result[0] if result else {}
+		return {
+			"institution_id": institution_id,
+			"total_students": facets.get("total", [{}])[0].get("count", 0) if facets.get("total") else 0,
+			"by_year": {item["_id"]: item["count"] for item in facets.get("by_year", [])},
+			"by_department": {item["_id"]: item["count"] for item in facets.get("by_department", [])},
+			"by_grade": {item["_id"]: item["count"] for item in facets.get("by_grade", [])},
+			"by_batch_year": {item["_id"]: item["count"] for item in facets.get("by_batch_year", [])},
+		}
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.get("/students/{roll_no_certificate_no}")
+async def superadmin_get_student(
+	roll_no_certificate_no: str,
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		document = await students_collections.find_one(
+			{"roll_no_certificate_no": _student_key(roll_no_certificate_no)}
+		)
+		if document is None:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+		return get_single_student_document(document)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.patch("/students/{roll_no_certificate_no}")
+async def superadmin_update_student(
+	roll_no_certificate_no: str,
+	student: UpdateStudents,
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		roll_no_certificate_no = _student_key(roll_no_certificate_no)
+		existing = await students_collections.find_one({"roll_no_certificate_no": roll_no_certificate_no})
+		if existing is None:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+		updates = student.model_dump(exclude_unset=True)
+		if not updates:
+			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one field is required")
+		for key in ("roll_no_certificate_no", "batch_year"):
+			if updates.get(key) is not None:
+				updates[key] = _student_key(updates[key])
+		if "roll_no_certificate_no" in updates or "batch_year" in updates:
+			new_roll_no = updates.get("roll_no_certificate_no", existing.get("roll_no_certificate_no"))
+			new_batch_year = updates.get("batch_year", existing.get("batch_year"))
+			clash = await students_collections.find_one(
+				{
+					"roll_no_certificate_no": new_roll_no,
+					"batch_year": new_batch_year,
+					"student_id": {"$ne": existing.get("student_id")},
+				}
+			)
+			if clash is not None:
+				raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Student already exists")
+		result = await students_collections.update_one(
+			{"student_id": existing["student_id"]}, {"$set": updates}
+		)
+		if result.matched_count == 0:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+		document = await students_collections.find_one({"student_id": existing["student_id"]})
+		return get_single_student_document(document)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.delete("/students/{roll_no_certificate_no}", status_code=status.HTTP_204_NO_CONTENT)
+async def superadmin_delete_student(
+	roll_no_certificate_no: str,
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		result = await students_collections.delete_one(
+			{"roll_no_certificate_no": _student_key(roll_no_certificate_no)}
+		)
+		if result.deleted_count == 0:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
