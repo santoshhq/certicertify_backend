@@ -9,6 +9,7 @@ class Students(BaseModel):
     grade:str
     batch_year:str=Field(...,)
     certificate_url:str
+    certificate_id:str
     
     
 class UpdateStudents(BaseModel):
@@ -20,5 +21,6 @@ class UpdateStudents(BaseModel):
     grade:Optional[str]=None
     batch_year:Optional[str]=None
     certificate_url:Optional[str]=None
+    certificate_id:Optional[str]=None
     
     

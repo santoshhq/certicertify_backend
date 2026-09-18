@@ -13,7 +13,7 @@ from models.students_models import UpdateStudents
 from schemas.students_schemas import get_all_documents, get_single_document
 from services.aws_s3 import upload_student_certificate
 from utils.jwt_token_auth import get_current_principal
-
+from utils.generate_ids import generate_numeric_id
 
 students_router = APIRouter(prefix="/students", tags=["Students"])
 logger = logging.getLogger(__name__)
@@ -244,12 +244,18 @@ async def upload_students(
 
 			certificate_url = None
 			certificate = certificates_by_roll_no.get(roll_no)
-			if certificate is not None:
-				try:
-					certificate_url = upload_student_certificate(certificate, institution_name, roll_no)
-					matched_roll_numbers.add(roll_no)
-				except HTTPException as error:
-					errors.append({"row": row_index, "reason": f"Certificate upload failed: {error.detail}"})
+			if certificate is None:
+				errors.append(
+					{"row": row_index, "reason": f"Certificate not found for roll number '{roll_no}', not added"}
+				)
+				continue
+
+			try:
+				certificate_url = upload_student_certificate(certificate, institution_name, roll_no)
+				matched_roll_numbers.add(roll_no)
+			except HTTPException as error:
+				errors.append({"row": row_index, "reason": f"Certificate upload failed: {error.detail}, not added"})
+				continue
 
 			document = {
 				"student_id": str(uuid4()),
@@ -263,6 +269,7 @@ async def upload_students(
 				"grade": row_data.get("grade", ""),
 				"batch_year": batch_year,
 				"certificate_url": certificate_url,
+                "certificate_id":generate_numeric_id(8)
 			}
 			documents.append(document)
 
@@ -388,15 +395,23 @@ async def get_student_stats(institution_id: str, principal: dict = Depends(get_c
 @students_router.get("/{roll_no_certificate_no}")
 async def get_student(roll_no_certificate_no: str):
 	try:
-		roll_no_certificate_no = _normalize_key(roll_no_certificate_no)
-		document = await students_collections.find_one({"roll_no_certificate_no": roll_no_certificate_no})
-		if document is None:
+		search_value = _normalize_key(roll_no_certificate_no)
+		documents = await students_collections.find(
+			{
+				"$or": [
+					{"roll_no_certificate_no": search_value},
+					{"certificate_id": search_value},
+				]
+			}
+		).to_list(length=None)
+		if not documents:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
-		return get_single_document(document)
+		return get_all_documents(documents)
 	except HTTPException:
 		raise
 	except Exception as error:
 		raise _internal_server_error(error) from error
+
 
 
 @students_router.patch("/{roll_no_certificate_no}")

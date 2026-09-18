@@ -23,7 +23,7 @@ from models.admin_model import Admin, UpdateAdmin
 from models.students_models import UpdateStudents
 from schemas.students_schemas import get_all_documents as get_all_student_documents, get_single_document as get_single_student_document
 from routers.students_router import upload_students
-
+from models.institutions_model import Register
 superadmin_router=APIRouter(prefix="/superadmin",tags=["Super Admin"])
 
 
@@ -346,6 +346,40 @@ async def delete_admin(
 	except Exception as error:
 		raise _internal_server_error(error) from error
 
+
+@superadmin_router.post("/add-instution")
+async def add_instution(
+	requests: Register,
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		document = requests.model_dump()
+		check_existing_acc = await institutions_collection.find_one({"institution_name": document.get("institution_name")})
+		if check_existing_acc:
+			raise HTTPException(status_code=400, detail="Institution name already present")
+
+		institution_id = str(uuid4())
+		payload = {
+			"name": document.get("name"),
+			"email_id": document.get("email_id"),
+			"institution_name": document.get("institution_name"),
+			"postal_code": document.get("postal_code"),
+			"city": document.get("city"),
+			"state": document.get("state"),
+			"country": document.get("country"),
+			"mobile_no": document.get("mobile_no"),
+			"password": document.get("password"),
+			"institution_id": institution_id,
+			"otp_verified": True,
+			"role": "institution",
+			"unique_id": generate_id(8),
+		}
+		await institutions_collection.insert_one(payload)
+		return get_single_document(payload)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise HTTPException(status_code=500, detail="Unable to create institution") from error
 #------------------------------------------------------------------------------------------------------------------
 #------------------------------------------------------------------------------------------------------------------
 #Students 

@@ -15,6 +15,7 @@ def get_single_document(document):
         "grade": document.get("grade"),
         "batch_year":document.get("batch_year"),
         "certificate_url": document.get("certificate_url"),
+        "certificate_id": document.get("certificate_id"),
     }
 
 def get_all_documents(documents):
