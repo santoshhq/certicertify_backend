@@ -8,12 +8,15 @@ def get_single_document(document):
         "name": document.get("name"),
         "email_id": document.get("email_id"),
         "institution_name": document.get("institution_name"),
+        "institution_name":document.get("institution_name"),
+        "gst_number":document.get("gst_number"),
         "postal_code": document.get("postal_code"),
         "city": document.get("city"),
         "state": document.get("state"),
         "country": document.get("country"),
         "mobile_no": document.get("mobile_no"),
         "otp_verified": document.get("otp_verified", False),
+        "superadmin_status":document.get("superadmin_status"),
         "status":document.get("status")
     }
 

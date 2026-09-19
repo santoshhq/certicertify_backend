@@ -13,6 +13,7 @@ from models.institutions_model import (
 	Register,
 	UpdateBase,
 	VerifyOTP,
+    InstitutionStatus
 )
 from schemas.institutions_schemas import get_all_documents, get_single_document
 from schemas.students_schemas import get_single_document as get_single_student_document
@@ -69,28 +70,61 @@ async def create_institution(institution: Register):
 
 @institutions_router.post("/login")
 async def login_institution(credentials: Login):
-	try:
-		document = await institutions_collection.find_one({"email_id": str(credentials.email_id)})
-		if document is None or credentials.password != document.get("password"):
-			raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
-		if not document.get("otp_verified", False):
-			raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Email OTP verification required")
+    try:
+        document = await institutions_collection.find_one(
+            {"email_id": str(credentials.email_id)}
+        )
+        if document is None or credentials.password != document.get("password"):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password",
+            )
+        if not document.get("otp_verified", False):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Email OTP verification required",
+            )
+        if not document.get("status", False):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Your Account is Inactive. Please Contact Admin or Superadmin",
+            )
+        token = create_access_token(
+            user_id=document["institution_id"],
+            role="institution",
+            institution_id=document["institution_id"],
+            email=document["email_id"],
+        )
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise _internal_server_error(error) from error
 
-		token = create_access_token(
-			user_id=document["institution_id"],
-			role="institution",
-			institution_id=document["institution_id"],
-			email=document["email_id"],
-		)
-		return {
-			"access_token": token,
-			"token_type": "bearer",
-		}
-	except HTTPException:
-		raise
-	except Exception as error:
-		raise _internal_server_error(error) from error
+@institutions_router.get("/superadmin_status")
+async def get_active_institution(
+    principal: dict = Depends(get_current_institution)
+):
+    institution = await institutions_collection.find_one(
+        {"institution_id": principal["institution_id"]}
+    )
 
+    if not institution:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Institution not found"
+        )
+
+    if institution.get("superadmin_status") != InstitutionStatus.APPROVED.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Institution is not approved"
+        )
+
+    return get_single_document(institution)
 
 @institutions_router.post("/password-reset/request")
 async def request_password_reset(payload: PasswordResetRequest):

@@ -24,17 +24,17 @@ class Register(BaseModel):
 
 
 class UpdateBase(BaseModel):
-	name: str | None = Field(default=None, min_length=1)
-	email_id: EmailStr | None = Field(default=None, min_length=1)
-	institution_name: str | None = Field(default=None, min_length=1)
-	postal_code: str | None = None
-	city: str | None = Field(default=None, min_length=1)
-	state: str | None = None
-	country: str | None = Field(default=None, min_length=1)
-	mobile_no: str | None = None
-	password: str | None = Field(default=None, min_length=8)
-	superadmin_status: InstitutionStatus | None = None
-    status:bool | None
+    name: str | None = Field(default=None, min_length=1)
+    email_id: EmailStr | None = Field(default=None, min_length=1)
+    institution_name: str | None = Field(default=None, min_length=1)
+    postal_code: str | None = None
+    city: str | None = Field(default=None, min_length=1)
+    state: str | None = None
+    country: str | None = Field(default=None, min_length=1)
+    mobile_no: str | None = None
+    password: str | None = Field(default=None, min_length=8)
+    superadmin_status: InstitutionStatus | None = None
+    status: bool | None = None
 
 
 class VerifyOTP(BaseModel):
