@@ -1,6 +1,7 @@
 import logging
 import re
 import zipfile
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
@@ -18,7 +19,7 @@ from utils.generate_ids import generate_numeric_id
 students_router = APIRouter(prefix="/students", tags=["Students"])
 logger = logging.getLogger(__name__)
 
-REQUIRED_FIELDS = ("roll_no_certificate_no", "student_name", "course_or_Acadamic", "month_year_pass")
+REQUIRED_FIELDS = ("roll_no", "certificate_no", "student_name", "course_or_Acadamic", "month_year_pass")
 ALLOWED_CERTIFICATE_EXTENSIONS = {"pdf", "jpg", "jpeg"}
 
 
@@ -98,8 +99,10 @@ def _map_column(normalized: str) -> str | None:
 		return None
 	if normalized.startswith(("sl", "si no", "si.no", "serial", "s.no", "s no")):
 		return None
+	if "certificate" in normalized or "cert no" in normalized:
+		return "certificate_no"
 	if "roll" in normalized:
-		return "roll_no_certificate_no"
+		return "roll_no"
 	if "sur" in normalized or "last name" in normalized:
 		return "surname_lastName"
 	if "course" in normalized or "academic" in normalized:
@@ -119,6 +122,11 @@ def _cell_text(value) -> str:
 	if value is None:
 		return ""
 	return str(value).strip()
+
+
+def _extract_year(value: str) -> int | None:
+	match = re.search(r"\d{4}", value or "")
+	return int(match.group()) if match else None
 
 
 def _normalize_key(value: str | None) -> str:
@@ -148,6 +156,9 @@ async def upload_students(
 		batch_year = _normalize_key(batch_year)
 		if not batch_year:
 			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Batch year is required")
+		batch_year_value = _extract_year(batch_year)
+		if batch_year_value is None or batch_year_value > date.today().year:
+			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Batch year cannot be in the future")
 		if not excel_file.filename or not excel_file.filename.lower().endswith((".xlsx", ".xlsm")):
 			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .xlsx Excel files are supported")
 
@@ -172,19 +183,24 @@ async def upload_students(
 
 		data_rows = list(rows)
 		column_fields = [_map_column(_normalize_header(header)) for header in header_row]
-		if "roll_no_certificate_no" not in column_fields:
+		if "roll_no" not in column_fields:
 			raise HTTPException(
 				status_code=status.HTTP_400_BAD_REQUEST,
-				detail="Excel file is missing the Roll Number / Certificate Number column",
+				detail="Excel file is missing the Roll Number column",
+			)
+		if "certificate_no" not in column_fields:
+			raise HTTPException(
+				status_code=status.HTTP_400_BAD_REQUEST,
+				detail="Excel file is missing the Certificate Number column",
 			)
 
 		expanded_certificates = await _expand_certificate_uploads(certificates)
 
-		certificates_by_roll_no = {
+		certificates_by_identifier = {
 			_normalize_key(Path(certificate.filename).stem): certificate
 			for certificate in expanded_certificates
 		}
-		matched_roll_numbers: set[str] = set()
+		matched_identifiers: set[str] = set()
 
 		documents = []
 		errors = []
@@ -208,7 +224,16 @@ async def upload_students(
 				errors.append({"row": row_index, "reason": f"Missing required field(s): {', '.join(missing)}"})
 				continue
 
-			roll_no = row_data["roll_no_certificate_no"] = _normalize_key(row_data["roll_no_certificate_no"])
+			roll_no = row_data["roll_no"] = _normalize_key(row_data["roll_no"])
+			row_data["certificate_no"] = _normalize_key(row_data["certificate_no"])
+
+			passout_year = _extract_year(row_data["month_year_pass"])
+			if passout_year is None or passout_year > date.today().year:
+				errors.append(
+					{"row": row_index, "reason": "Passout year (month_year_pass) cannot be in the future, not added"}
+				)
+				continue
+
 			student_key = (roll_no, batch_year)
 			if student_key in seen_in_file:
 				errors.append(
@@ -225,11 +250,11 @@ async def upload_students(
 		existing_students_keys: set[tuple[str, str]] = set()
 		if valid_rows:
 			existing_students = await students_collections.find(
-				{"roll_no_certificate_no": {"$in": [roll_no for _, roll_no, _ in valid_rows]}},
-				{"roll_no_certificate_no": 1, "batch_year": 1},
+				{"roll_no": {"$in": [roll_no for _, roll_no, _ in valid_rows]}},
+				{"roll_no": 1, "batch_year": 1},
 			).to_list(length=None)
 			existing_students_keys = {
-				(doc["roll_no_certificate_no"], doc.get("batch_year")) for doc in existing_students
+				(doc["roll_no"], doc.get("batch_year")) for doc in existing_students
 			}
 
 		for row_index, roll_no, row_data in valid_rows:
@@ -242,17 +267,27 @@ async def upload_students(
 				)
 				continue
 
-			certificate_url = None
-			certificate = certificates_by_roll_no.get(roll_no)
+			certificate_no = row_data["certificate_no"]
+			matched_identifier = roll_no
+			certificate = certificates_by_identifier.get(roll_no)
+			if certificate is None:
+				matched_identifier = certificate_no
+				certificate = certificates_by_identifier.get(certificate_no)
 			if certificate is None:
 				errors.append(
-					{"row": row_index, "reason": f"Certificate not found for roll number '{roll_no}', not added"}
+					{
+						"row": row_index,
+						"reason": (
+							f"Certificate not found for roll number '{roll_no}' "
+							f"or certificate number '{certificate_no}', not added"
+						),
+					}
 				)
 				continue
 
 			try:
 				certificate_url = upload_student_certificate(certificate, institution_name, roll_no)
-				matched_roll_numbers.add(roll_no)
+				matched_identifiers.add(matched_identifier)
 			except HTTPException as error:
 				errors.append({"row": row_index, "reason": f"Certificate upload failed: {error.detail}, not added"})
 				continue
@@ -261,7 +296,8 @@ async def upload_students(
 				"student_id": str(uuid4()),
 				"institution_id": institution_id,
 				"institution_name": institution_name,
-				"roll_no_certificate_no": roll_no,
+				"certificate_no": row_data["certificate_no"],
+				"roll_no": roll_no,
 				"student_name": row_data["student_name"],
 				"surname_lastName": row_data.get("surname_lastName", ""),
 				"course_or_Acadamic": row_data["course_or_Acadamic"],
@@ -269,7 +305,7 @@ async def upload_students(
 				"grade": row_data.get("grade", ""),
 				"batch_year": batch_year,
 				"certificate_url": certificate_url,
-                "certificate_id":generate_numeric_id(8)
+				"certificate_id": generate_numeric_id(8),
 			}
 			documents.append(document)
 
@@ -278,8 +314,8 @@ async def upload_students(
 
 		unmatched_certificates = [
 			certificate.filename
-			for stem, certificate in certificates_by_roll_no.items()
-			if stem not in matched_roll_numbers
+			for stem, certificate in certificates_by_identifier.items()
+			if stem not in matched_identifiers
 		]
 
 		return {
@@ -392,14 +428,15 @@ async def get_student_stats(institution_id: str, principal: dict = Depends(get_c
 		raise _internal_server_error(error) from error
 
 
-@students_router.get("/{roll_no_certificate_no}")
-async def get_student(roll_no_certificate_no: str):
+@students_router.get("/{identifier}")
+async def get_student(identifier: str):
 	try:
-		search_value = _normalize_key(roll_no_certificate_no)
+		search_value = _normalize_key(identifier)
 		documents = await students_collections.find(
 			{
 				"$or": [
-					{"roll_no_certificate_no": search_value},
+					{"roll_no": search_value},
+					{"certificate_no": search_value},
 					{"certificate_id": search_value},
 				]
 			}
@@ -414,15 +451,15 @@ async def get_student(roll_no_certificate_no: str):
 
 
 
-@students_router.patch("/{roll_no_certificate_no}")
+@students_router.patch("/{roll_no}")
 async def update_student(
-	roll_no_certificate_no: str,
+	roll_no: str,
 	student: UpdateStudents,
 	principal: dict = Depends(get_current_principal),
 ):
 	try:
-		roll_no_certificate_no = _normalize_key(roll_no_certificate_no)
-		existing = await students_collections.find_one({"roll_no_certificate_no": roll_no_certificate_no})
+		roll_no = _normalize_key(roll_no)
+		existing = await students_collections.find_one({"roll_no": roll_no})
 		if existing is None:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
 		if existing.get("institution_id") != principal.get("institution_id"):
@@ -431,17 +468,17 @@ async def update_student(
 		updates = student.model_dump(exclude_unset=True)
 		if not updates:
 			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one field is required")
-		for key in ("roll_no_certificate_no", "batch_year"):
+		for key in ("roll_no", "certificate_no", "batch_year"):
 			if updates.get(key) is not None:
 				updates[key] = _normalize_key(updates[key])
 
 		# Keep (roll number, batch year) unique when either half of the key changes.
-		if "roll_no_certificate_no" in updates or "batch_year" in updates:
-			new_roll_no = updates.get("roll_no_certificate_no", existing.get("roll_no_certificate_no"))
+		if "roll_no" in updates or "batch_year" in updates:
+			new_roll_no = updates.get("roll_no", existing.get("roll_no"))
 			new_batch_year = updates.get("batch_year", existing.get("batch_year"))
 			clash = await students_collections.find_one(
 				{
-					"roll_no_certificate_no": new_roll_no,
+					"roll_no": new_roll_no,
 					"batch_year": new_batch_year,
 					"student_id": {"$ne": existing.get("student_id")},
 				}
@@ -453,14 +490,14 @@ async def update_student(
 				)
 
 		result = await students_collections.update_one(
-			{"roll_no_certificate_no": roll_no_certificate_no},
+			{"roll_no": roll_no},
 			{"$set": updates},
 		)
 		if result.matched_count == 0:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
 
-		updated_roll_no = updates.get("roll_no_certificate_no", roll_no_certificate_no)
-		document = await students_collections.find_one({"roll_no_certificate_no": updated_roll_no})
+		updated_roll_no = updates.get("roll_no", roll_no)
+		document = await students_collections.find_one({"roll_no": updated_roll_no})
 		return get_single_document(document)
 	except HTTPException:
 		raise
@@ -468,17 +505,17 @@ async def update_student(
 		raise _internal_server_error(error) from error
 
 
-@students_router.delete("/{roll_no_certificate_no}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_student(roll_no_certificate_no: str, principal: dict = Depends(get_current_principal)):
+@students_router.delete("/{roll_no}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_student(roll_no: str, principal: dict = Depends(get_current_principal)):
 	try:
-		roll_no_certificate_no = _normalize_key(roll_no_certificate_no)
-		existing = await students_collections.find_one({"roll_no_certificate_no": roll_no_certificate_no})
+		roll_no = _normalize_key(roll_no)
+		existing = await students_collections.find_one({"roll_no": roll_no})
 		if existing is None:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
 		if existing.get("institution_id") != principal.get("institution_id"):
 			raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized for this student")
 
-		result = await students_collections.delete_one({"roll_no_certificate_no": roll_no_certificate_no})
+		result = await students_collections.delete_one({"roll_no": roll_no})
 		if result.deleted_count == 0:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
 	except HTTPException:

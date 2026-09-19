@@ -6,6 +6,7 @@ class Admin(BaseModel):
     mobilenumber:str=Field(...,)
     admin_userId:str=Field(...,min_length=8, max_length=8)
     password:str=Field(...,min_length=8)
+    
 
 class UpdateAdmin(BaseModel):
     admin_name:Optional[str]=Field(default=None)

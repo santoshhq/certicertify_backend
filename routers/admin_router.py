@@ -7,6 +7,8 @@ from schemas.students_schemas import get_all_documents as get_all_student_docume
 from fastapi import APIRouter, File, Form, HTTPException, Depends, UploadFile, status
 from utils.jwt_token_auth import get_current_admin, create_access_token
 from routers.students_router import upload_students
+from services.aws_s3 import upload_student_certificate
+from routers.superadmin_routers import _read_replacement_certificate
 
 
 admin_routers=APIRouter(prefix="/admin",tags=["Admin"])
@@ -208,14 +210,14 @@ async def admin_get_student_stats(
         raise _internal_server_error(error) from error
 
 
-@admin_routers.get("/students/{roll_no_certificate_no}")
+@admin_routers.get("/students/{roll_no}")
 async def admin_get_student(
-    roll_no_certificate_no: str,
+    roll_no: str,
     current_admin: dict = Depends(get_current_admin),
 ):
     try:
         document = await students_collections.find_one(
-            {"roll_no_certificate_no": _student_key(roll_no_certificate_no)}
+            {"roll_no": _student_key(roll_no)}
         )
         if document is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
@@ -226,29 +228,62 @@ async def admin_get_student(
         raise _internal_server_error(error) from error
 
 
-@admin_routers.patch("/students/{roll_no_certificate_no}")
+@admin_routers.patch("/students/{roll_no}/certificate", status_code=status.HTTP_200_OK)
+async def admin_replace_student_certificate(
+    roll_no: str,
+    certificate: UploadFile = File(...),
+    current_admin: dict = Depends(get_current_admin),
+):
+    try:
+        student_key = _student_key(roll_no)
+        existing = await students_collections.find_one({"roll_no": student_key})
+        if existing is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+        await _read_replacement_certificate(certificate)
+        certificate_url = upload_student_certificate(
+            certificate,
+            existing.get("institution_name", ""),
+            student_key,
+        )
+        result = await students_collections.update_one(
+            {"student_id": existing["student_id"]},
+            {"$set": {"certificate_url": certificate_url}},
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+        document = await students_collections.find_one({"student_id": existing["student_id"]})
+        return get_single_student_document(document)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise _internal_server_error(error) from error
+
+
+@admin_routers.patch("/students/{roll_no}")
 async def admin_update_student(
-    roll_no_certificate_no: str,
+    roll_no: str,
     student: UpdateStudents,
     current_admin: dict = Depends(get_current_admin),
 ):
     try:
-        roll_no_certificate_no = _student_key(roll_no_certificate_no)
-        existing = await students_collections.find_one({"roll_no_certificate_no": roll_no_certificate_no})
+        roll_no = _student_key(roll_no)
+        existing = await students_collections.find_one({"roll_no": roll_no})
         if existing is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
         updates = student.model_dump(exclude_unset=True)
         if not updates:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one field is required")
-        for key in ("roll_no_certificate_no", "batch_year"):
+        for key in ("roll_no", "batch_year"):
             if updates.get(key) is not None:
                 updates[key] = _student_key(updates[key])
-        if "roll_no_certificate_no" in updates or "batch_year" in updates:
-            new_roll_no = updates.get("roll_no_certificate_no", existing.get("roll_no_certificate_no"))
+        if "roll_no" in updates or "batch_year" in updates:
+            new_roll_no = updates.get("roll_no", existing.get("roll_no"))
             new_batch_year = updates.get("batch_year", existing.get("batch_year"))
             clash = await students_collections.find_one(
                 {
-                    "roll_no_certificate_no": new_roll_no,
+                    "roll_no": new_roll_no,
                     "batch_year": new_batch_year,
                     "student_id": {"$ne": existing.get("student_id")},
                 }
@@ -268,14 +303,14 @@ async def admin_update_student(
         raise _internal_server_error(error) from error
 
 
-@admin_routers.delete("/students/{roll_no_certificate_no}", status_code=status.HTTP_204_NO_CONTENT)
+@admin_routers.delete("/students/{roll_no}", status_code=status.HTTP_204_NO_CONTENT)
 async def admin_delete_student(
-    roll_no_certificate_no: str,
+    roll_no: str,
     current_admin: dict = Depends(get_current_admin),
 ):
     try:
         result = await students_collections.delete_one(
-            {"roll_no_certificate_no": _student_key(roll_no_certificate_no)}
+            {"roll_no": _student_key(roll_no)}
         )
         if result.deleted_count == 0:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")

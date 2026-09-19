@@ -143,11 +143,11 @@ def upload_certificate(file: UploadFile):
 # 4. UPLOAD STUDENT CERTIFICATE
 # ============================================================
 
-def upload_student_certificate(file: UploadFile, institution_name: str, roll_no_certificate_no: str) -> str:
+def upload_student_certificate(file: UploadFile, institution_name: str, roll_no: str) -> str:
     """
     Upload a student's certificate (PDF or JPG) to:
 
-        certificates/<institution_name>_<roll_no_certificate_no>.<ext>
+        certificates/<institution_name>_<roll_no>.<ext>
 
     Returns the certificate's public S3 URL.
     """
@@ -161,7 +161,7 @@ def upload_student_certificate(file: UploadFile, institution_name: str, roll_no_
             detail="Only PDF and JPG certificates are allowed."
         )
 
-    filename = f"{_slugify(institution_name)}_{_slugify(roll_no_certificate_no)}.{extension}"
+    filename = f"{_slugify(institution_name)}_{_slugify(roll_no)}.{extension}"
     s3_key = f"certificates/{filename}"
 
     bucket = os.getenv("AWS_S3_BUCKET")

@@ -3,9 +3,9 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from utils.generate_ids import generate_id
-from config.db_collections import institutions_collection
+from config.db_collections import institutions_collection, students_collections
 from models.institutions_model import (
 	Login,
 	PasswordResetConfirm,
@@ -15,7 +15,10 @@ from models.institutions_model import (
 	VerifyOTP,
 )
 from schemas.institutions_schemas import get_all_documents, get_single_document
+from schemas.students_schemas import get_single_document as get_single_student_document
 from services.email_service import institution_account_verify, institution_password_reset
+from services.aws_s3 import upload_student_certificate
+from routers.superadmin_routers import _read_replacement_certificate
 from utils.jwt_token_auth import create_access_token, get_current_institution,get_current_superadmin
 
 
@@ -210,6 +213,44 @@ async def delete_institution(institution_id: str, principal: dict = Depends(get_
 		result = await institutions_collection.delete_one({"institution_id": institution_id})
 		if result.deleted_count == 0:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Institution not found")
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@institutions_router.patch("/students/{roll_no}/certificate", status_code=status.HTTP_200_OK)
+async def institution_replace_student_certificate(
+	roll_no: str,
+	certificate: UploadFile = File(...),
+	principal: dict = Depends(get_current_institution),
+):
+	try:
+		student_key = " ".join(str(roll_no).strip().upper().split())
+		existing = await students_collections.find_one(
+			{
+				"roll_no": student_key,
+				"institution_id": principal.get("institution_id"),
+			}
+		)
+		if existing is None:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+		await _read_replacement_certificate(certificate)
+		certificate_url = upload_student_certificate(
+			certificate,
+			existing.get("institution_name", ""),
+			student_key,
+		)
+		result = await students_collections.update_one(
+			{"student_id": existing["student_id"], "institution_id": principal.get("institution_id")},
+			{"$set": {"certificate_url": certificate_url}},
+		)
+		if result.matched_count == 0:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+		document = await students_collections.find_one({"student_id": existing["student_id"]})
+		return get_single_student_document(document)
 	except HTTPException:
 		raise
 	except Exception as error:

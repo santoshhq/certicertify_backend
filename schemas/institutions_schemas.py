@@ -14,6 +14,7 @@ def get_single_document(document):
         "country": document.get("country"),
         "mobile_no": document.get("mobile_no"),
         "otp_verified": document.get("otp_verified", False),
+        "status":document.get("status")
     }
 
 def get_all_documents(documents):

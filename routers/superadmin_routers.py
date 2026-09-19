@@ -11,13 +11,16 @@ from utils.generate_ids import generate_id
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
+from pathlib import Path
+import os
 import secrets
 from schemas.superadmin_schemas import single_document
 from schemas.institutions_schemas import get_all_documents, get_single_document
 from schemas.admin_schemas import get_all_admin_doc, single_admin_doc
 from services.email_service import admin_account_created, superadmin_account_verify, superadmin_password_reset
+from services.aws_s3 import upload_student_certificate
 from utils.jwt_token_auth import create_access_token, get_current_superadmin
-from models.institutions_model import UpdateBase
+from models.institutions_model import InstitutionStatus, UpdateBase
 from config.db_collections import admins_collection
 from models.admin_model import Admin, UpdateAdmin
 from models.students_models import UpdateStudents
@@ -373,6 +376,7 @@ async def add_instution(
 			"otp_verified": True,
 			"role": "institution",
 			"unique_id": generate_id(8),
+			"status": InstitutionStatus.APPROVED,
 		}
 		await institutions_collection.insert_one(payload)
 		return get_single_document(payload)
@@ -406,6 +410,34 @@ async def superadmin_upload_students(
 
 def _student_key(value: str) -> str:
 	return " ".join(str(value).strip().upper().split())
+
+
+def _certificate_max_size_bytes() -> int:
+	try:
+		max_size_mb = int(os.getenv("CERTIFICATE_MAX_SIZE_MB", "10"))
+	except ValueError:
+		max_size_mb = 10
+	return max(max_size_mb, 1) * 1024 * 1024
+
+
+async def _read_replacement_certificate(certificate: UploadFile) -> None:
+	filename = certificate.filename or ""
+	if not filename:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Certificate file is required")
+	if Path(filename).name != filename:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid certificate filename")
+
+	extension = Path(filename).suffix.lower()
+	if extension not in {".pdf", ".jpg", ".jpeg"}:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only PDF, JPG and JPEG certificates are allowed")
+
+	max_size_bytes = _certificate_max_size_bytes()
+	content = await certificate.read(max_size_bytes + 1)
+	if not content:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Certificate file cannot be empty")
+	if len(content) > max_size_bytes:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Certificate file exceeds the maximum allowed size")
+	certificate.file.seek(0)
 
 
 @superadmin_router.get("/students/institution/{institution_name}")
@@ -495,14 +527,14 @@ async def superadmin_get_student_stats(
 		raise _internal_server_error(error) from error
 
 
-@superadmin_router.get("/students/{roll_no_certificate_no}")
+@superadmin_router.get("/students/{roll_no}")
 async def superadmin_get_student(
-	roll_no_certificate_no: str,
+	roll_no: str,
 	current_superadmin: dict = Depends(get_current_superadmin),
 ):
 	try:
 		document = await students_collections.find_one(
-			{"roll_no_certificate_no": _student_key(roll_no_certificate_no)}
+			{"roll_no": _student_key(roll_no)}
 		)
 		if document is None:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
@@ -513,29 +545,62 @@ async def superadmin_get_student(
 		raise _internal_server_error(error) from error
 
 
-@superadmin_router.patch("/students/{roll_no_certificate_no}")
+@superadmin_router.patch("/students/{roll_no}/certificate", status_code=status.HTTP_200_OK)
+async def superadmin_replace_student_certificate(
+	roll_no: str,
+	certificate: UploadFile = File(...),
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		student_key = _student_key(roll_no)
+		existing = await students_collections.find_one({"roll_no": student_key})
+		if existing is None:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+		await _read_replacement_certificate(certificate)
+		certificate_url = upload_student_certificate(
+			certificate,
+			existing.get("institution_name", ""),
+			student_key,
+		)
+		result = await students_collections.update_one(
+			{"student_id": existing["student_id"]},
+			{"$set": {"certificate_url": certificate_url}},
+		)
+		if result.matched_count == 0:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+		updated_student = await students_collections.find_one({"student_id": existing["student_id"]})
+		return get_single_student_document(updated_student)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
+@superadmin_router.patch("/students/{roll_no}")
 async def superadmin_update_student(
-	roll_no_certificate_no: str,
+	roll_no: str,
 	student: UpdateStudents,
 	current_superadmin: dict = Depends(get_current_superadmin),
 ):
 	try:
-		roll_no_certificate_no = _student_key(roll_no_certificate_no)
-		existing = await students_collections.find_one({"roll_no_certificate_no": roll_no_certificate_no})
+		roll_no = _student_key(roll_no)
+		existing = await students_collections.find_one({"roll_no": roll_no})
 		if existing is None:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
 		updates = student.model_dump(exclude_unset=True)
 		if not updates:
 			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one field is required")
-		for key in ("roll_no_certificate_no", "batch_year"):
+		for key in ("roll_no", "batch_year"):
 			if updates.get(key) is not None:
 				updates[key] = _student_key(updates[key])
-		if "roll_no_certificate_no" in updates or "batch_year" in updates:
-			new_roll_no = updates.get("roll_no_certificate_no", existing.get("roll_no_certificate_no"))
+		if "roll_no" in updates or "batch_year" in updates:
+			new_roll_no = updates.get("roll_no", existing.get("roll_no"))
 			new_batch_year = updates.get("batch_year", existing.get("batch_year"))
 			clash = await students_collections.find_one(
 				{
-					"roll_no_certificate_no": new_roll_no,
+					"roll_no": new_roll_no,
 					"batch_year": new_batch_year,
 					"student_id": {"$ne": existing.get("student_id")},
 				}
@@ -555,14 +620,14 @@ async def superadmin_update_student(
 		raise _internal_server_error(error) from error
 
 
-@superadmin_router.delete("/students/{roll_no_certificate_no}", status_code=status.HTTP_204_NO_CONTENT)
+@superadmin_router.delete("/students/{roll_no}", status_code=status.HTTP_204_NO_CONTENT)
 async def superadmin_delete_student(
-	roll_no_certificate_no: str,
+	roll_no: str,
 	current_superadmin: dict = Depends(get_current_superadmin),
 ):
 	try:
 		result = await students_collections.delete_one(
-			{"roll_no_certificate_no": _student_key(roll_no_certificate_no)}
+			{"roll_no": _student_key(roll_no)}
 		)
 		if result.deleted_count == 0:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
