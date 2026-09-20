@@ -19,7 +19,31 @@ def _internal_server_error(error: Exception) -> HTTPException:
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="Unable to process admin request",
     )
+#Admin Permission Validation 
 
+
+def require_permission(permission: str):
+
+    async def permission_checker(
+        current_admin: dict = Depends(get_current_admin)
+    ):
+        access_level = current_admin.get("access_level")
+
+        # Full-control admin
+        if access_level == "full":
+            return current_admin
+
+        permissions = current_admin.get("permissions", {})
+
+        if permissions.get(permission) is not True:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"You do not have permission: {permission}",
+            )
+
+        return current_admin
+
+    return permission_checker
 
 @admin_routers.post("/login")
 async def admin_login(requests:Login):
@@ -46,10 +70,10 @@ async def admin_login(requests:Login):
 
 #---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 #---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-#Institutions (same as superadmin)
+#Institutions 
 
 @admin_routers.get("/admin-get-all-institutes")
-async def get_all_institutions(current_admin: dict = Depends(get_current_admin)):
+async def get_all_institutions(current_admin: dict = Depends(require_permission("institutions_view"))):
     try:
         documents = await institutions_collection.find().to_list(length=None)
         return get_all_documents(documents)
@@ -61,7 +85,7 @@ async def get_all_institutions(current_admin: dict = Depends(get_current_admin))
 async def update_institution(
     institution_id: str,
     institution: UpdateBase,
-    current_admin: dict = Depends(get_current_admin),
+    current_admin: dict = Depends(require_permission("institutions_update")),
 ):
     try:
         updates = institution.model_dump(exclude_unset=True)
@@ -84,7 +108,7 @@ async def update_institution(
 
 
 @admin_routers.delete("/delete-institution/{institution_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_institution(institution_id: str, current_admin: dict = Depends(get_current_admin)):
+async def delete_institution(institution_id: str, current_admin: dict = Depends(require_permission("institutions_delete"))):
     try:
         result = await institutions_collection.delete_one({"institution_id": institution_id})
         if result.deleted_count == 0:
@@ -104,7 +128,7 @@ async def admin_upload_students(
     certificates: list[UploadFile] = File(default=[]),
     batch_year: str = Form(...),
     institution_id: str = Form(...),
-    current_admin: dict = Depends(get_current_admin),
+    current_admin: dict = Depends(require_permission("students_create")),
 ):
     try:
         return await upload_students(
@@ -126,7 +150,7 @@ def _student_key(value: str) -> str:
 @admin_routers.get("/students/institution/{institution_name}")
 async def admin_get_students_by_institution(
     institution_name: str,
-    current_admin: dict = Depends(get_current_admin),
+    current_admin: dict = Depends(require_permission("students_view")),
 ):
     try:
         documents = await students_collections.find({"institution_name": institution_name}).to_list(length=None)
@@ -139,7 +163,7 @@ async def admin_get_students_by_institution(
 async def admin_get_students_by_year(
     institution_name: str,
     year: int,
-    current_admin: dict = Depends(get_current_admin),
+    current_admin: dict = Depends(require_permission("students_view")),
 ):
     try:
         documents = await students_collections.find(
@@ -154,7 +178,7 @@ async def admin_get_students_by_year(
 async def admin_get_students_by_batch(
     institution_name: str,
     batch_year: str,
-    current_admin: dict = Depends(get_current_admin),
+    current_admin: dict = Depends(require_permission("students_view")),
 ):
     try:
         documents = await students_collections.find(
@@ -168,7 +192,7 @@ async def admin_get_students_by_batch(
 @admin_routers.get("/students/stats/{institution_id}")
 async def admin_get_student_stats(
     institution_id: str,
-    current_admin: dict = Depends(get_current_admin),
+    current_admin: dict = Depends(require_permission("students_view")),
 ):
     try:
         result = await students_collections.aggregate(
@@ -213,7 +237,7 @@ async def admin_get_student_stats(
 @admin_routers.get("/students/{roll_no}")
 async def admin_get_student(
     roll_no: str,
-    current_admin: dict = Depends(get_current_admin),
+    current_admin: dict = Depends(require_permission("students_view")),
 ):
     try:
         document = await students_collections.find_one(
@@ -232,7 +256,7 @@ async def admin_get_student(
 async def admin_replace_student_certificate(
     roll_no: str,
     certificate: UploadFile = File(...),
-    current_admin: dict = Depends(get_current_admin),
+    current_admin: dict = Depends(require_permission("students_update")),
 ):
     try:
         student_key = _student_key(roll_no)
@@ -265,7 +289,7 @@ async def admin_replace_student_certificate(
 async def admin_update_student(
     roll_no: str,
     student: UpdateStudents,
-    current_admin: dict = Depends(get_current_admin),
+    current_admin: dict = Depends(require_permission("students_update")),
 ):
     try:
         roll_no = _student_key(roll_no)
@@ -306,7 +330,7 @@ async def admin_update_student(
 @admin_routers.delete("/students/{roll_no}", status_code=status.HTTP_204_NO_CONTENT)
 async def admin_delete_student(
     roll_no: str,
-    current_admin: dict = Depends(get_current_admin),
+    current_admin: dict = Depends(require_permission("students_delete")),
 ):
     try:
         result = await students_collections.delete_one(
@@ -318,3 +342,4 @@ async def admin_delete_student(
         raise
     except Exception as error:
         raise _internal_server_error(error) from error
+
