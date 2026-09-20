@@ -1,0 +1,536 @@
+========================================================================
+CERTICERTIFY BACKEND - API ENDPOINTS REFERENCE (for Frontend rework)
+Generated: 2026-09-20
+Base URL: no global prefix. Each router is mounted at root with its own
+prefix (see main.py -> app.include_router(...)).
+========================================================================
+
+ROLES IN THE SYSTEM
+  - superadmin   -> full platform control
+  - admin        -> created by a superadmin, now has GRANULAR PERMISSIONS
+                    (this is what changed recently - see "WHAT CHANGED" at
+                    the bottom, including 2 BACKEND BUGS that will block
+                    the admin flows until fixed)
+  - institution  -> a college/institute account, manages only itself
+  - (public)     -> unauthenticated lookup endpoint for certificate check
+
+AUTH MECHANISM
+  - All protected endpoints use: Authorization: Bearer <JWT>
+  - Token obtained from the respective /login endpoint.
+  - Token payload (decoded) currently contains only:
+      sub, role, organization_id, institution_id, email, token_type, exp
+    NOTE: it does NOT contain access_level or permissions for admins
+    (see bug #1 below).
+
+========================================================================
+1) SUPERADMIN ENDPOINTS  -  prefix: /superadmin
+========================================================================
+
+--- Auth / Account ---
+
+POST /superadmin/register
+  Auth: none
+  Body (SuperAdmin):
+    { fullname: str, email: EmailStr, mobilenumber: str, password: str(min 8) }
+  Response: { message: "Superadmin registered. Verification OTP sent." }
+  Notes: creates account with otp_verified=false, sends OTP email.
+
+POST /superadmin/login
+  Auth: none
+  Body (Login): { email: EmailStr, password: str(min 8) }
+  Response: { access_token, token_type: "bearer" }
+  Errors: 401 invalid credentials, 403 if OTP not verified yet.
+
+POST /superadmin/verify-otp
+  Auth: none
+  Body (VerifyOTP): { email: EmailStr, otp: str(6 digits) }
+  Response: full superadmin document (single_document schema)
+  Errors: 404 not found, 400 invalid/expired OTP.
+
+POST /superadmin/password-reset/request
+  Auth: none
+  Body: { email: EmailStr }
+  Response: { message: "Password reset OTP sent" }
+
+POST /superadmin/password-reset/confirm
+  Auth: none
+  Body: { email: EmailStr, otp: str(6 digits), new_password: str(min 8) }
+  Response: { message: "Password reset successfully" }
+
+--- Institutions (managed by superadmin) ---
+
+GET /superadmin/superadmin-get-all-institutes
+  Auth: superadmin
+  Response: array of institution documents (see "Institution document shape" below)
+
+PATCH /superadmin/superadmin-update-institution/{institution_id}
+  Auth: superadmin
+  Body (UpdateBase, all optional): name, email_id, institution_name,
+    institutional_code, gst_number, postal_code, city, state, country,
+    mobile_no, password, superadmin_status (Approved|Pending|Suspended),
+    status (bool)
+  Response: updated institution document
+  Errors: 400 no fields given, 404 not found.
+
+DELETE /superadmin/delete-institution/{institution_id}
+  Auth: superadmin
+  Response: 204 No Content
+  Errors: 404 not found.
+
+POST /superadmin/add-instution   (note: route name is misspelled "instution")
+  Auth: superadmin
+  Body (Register):
+    { name, email_id, institution_name, institutional_code, gst_number,
+      postal_code?, city, state?, country, mobile_no?, password(min 8),
+      superadmin_status? (default Pending), status? (default true) }
+  Response: created institution document.
+  Notes: superadmin-created institutions are auto-approved
+    (status forced to InstitutionStatus.APPROVED) and otp_verified=true,
+    so it skips the self-registration OTP flow entirely.
+  Errors: 400 if institution_name already exists.
+
+--- Admin management (superadmin creates/edits admins) ---
+
+POST /superadmin/admin-creation
+  Auth: superadmin
+  Body (Admin):
+    {
+      admin_name: str,
+      email: EmailStr,
+      mobilenumber: str,
+      admin_userId: str (exactly 8 chars) -> becomes admin's login id,
+      password: str (min 8),
+      access_level: "full" | "custom"  (default "custom"),
+      permissions: {                    (default all false)
+        students_view: bool, students_create: bool,
+        students_update: bool, students_delete: bool,
+        institutions_view: bool, institutions_create: bool,
+        institutions_update: bool, institutions_delete: bool
+      },
+      status: bool (default true)
+    }
+  Response: { message: "Admin registration successful" }
+  Errors: 400 admin_userId already exists, 400 email already registered
+          for this superadmin.
+  *** BUG (backend, needs fix before frontend relies on it) ***
+  access_level, permissions and status are accepted in the request body
+  but are NOT saved to the database - the insert payload in
+  routers/superadmin_routers.py (add_new_admin) only stores admin_id,
+  admin_loginId, admin_name, email, mobilenumber, password, superadmin_id,
+  role. So today, every admin is effectively created with no
+  access_level/permissions in the DB. See "WHAT CHANGED" section.
+
+GET /superadmin/admins
+  Auth: superadmin
+  Response: array of admin documents scoped to this superadmin, shape:
+    { admin_id, admin_loginId, admin_name, email, mobilenumber,
+      password, superadmin_id, role }
+  *** GAP: this response shape (schemas/admin_schemas.py) does NOT
+  include access_level/permissions/status, so the frontend cannot
+  currently see or render an admin's permission set from this endpoint
+  even once bug above is fixed. Needs a backend schema update. ***
+
+PATCH /superadmin/admin/{admin_id}
+  Auth: superadmin
+  Body (UpdateAdmin, all optional):
+    admin_name, email, mobilenumber,
+    admin_userId (8 chars, maps to admin_loginId),
+    password (min 8), access_level ("full"|"custom"), permissions (object,
+    same shape as above), status (bool)
+  Response: updated admin document (same limited shape as single_admin_doc
+    above - access_level/permissions/status not returned, same gap as GET).
+  Errors: 400 no fields, 400 admin_userId already exists, 400 email already
+    registered, 404 admin not found.
+
+DELETE /superadmin/admin/{admin_id}
+  Auth: superadmin
+  Response: 204 No Content
+  Errors: 404 not found.
+
+--- Students (superadmin has full cross-institution access) ---
+  Identical route set/behavior to the Admin student routes below, just
+  under prefix /superadmin instead of /admin, and permission gate is only
+  "must be superadmin" (no granular permission check).
+
+POST   /superadmin/students/upload            (multipart form, see below)
+GET    /superadmin/students/institution/{institution_name}
+GET    /superadmin/students/institution/{institution_name}/year/{year}
+GET    /superadmin/students/institution/{institution_name}/batch/{batch_year}
+GET    /superadmin/students/stats/{institution_id}
+GET    /superadmin/students/{roll_no}
+PATCH  /superadmin/students/{roll_no}/certificate   (multipart form)
+PATCH  /superadmin/students/{roll_no}
+DELETE /superadmin/students/{roll_no}
+
+  (See full field/body details under section 4 "STUDENTS" - the request/
+  response shapes are identical, only the auth dependency differs.)
+
+
+========================================================================
+2) ADMIN ENDPOINTS  -  prefix: /admin
+========================================================================
+
+POST /admin/login
+  Auth: none
+  Body (Login): { admin_loginId: str, password: str }
+  Response: { access_token, token_type: "bearer" }
+  Errors: 404 admin not found, 400 invalid credentials.
+  *** BUG (backend, needs fix) ***
+  create_access_token() is called with only user_id/role/email - it does
+  NOT embed access_level or permissions into the JWT. Every other admin
+  endpoint below is now protected by require_permission(...), which reads
+  current_admin.get("access_level") and current_admin.get("permissions")
+  straight off the decoded token. Since those keys are never in the
+  token, access_level is always None (never "full") and permissions is
+  always {} - so EVERY permission check currently fails and ALL admin
+  endpoints below return 403 Forbidden for ALL admins, regardless of what
+  is stored in the database or how they were created.
+  This must be fixed backend-side (e.g. embed access_level/permissions in
+  the JWT at login, or look them up from the DB inside require_permission)
+  before the frontend can exercise any admin permission-gated screen.
+
+--- Institutions (read/update/delete only - admins cannot create) ---
+
+GET /admin/admin-get-all-institutes
+  Auth: admin + permission "institutions_view"
+  Response: array of institution documents (same shape as superadmin's).
+
+PATCH /admin/admin-update-institution/{institution_id}
+  Auth: admin + permission "institutions_update"
+  Body (UpdateBase) - same fields as superadmin's update-institution.
+  Response: updated institution document.
+
+DELETE /admin/delete-institution/{institution_id}
+  Auth: admin + permission "institutions_delete"
+  Response: 204 No Content.
+
+  NOTE: there is no admin endpoint to CREATE an institution, and no
+  permission flag named "institutions_create" is enforced anywhere
+  (the AdminPermissions model defines institutions_create but no route
+  currently checks it - dead flag from the frontend's point of view,
+  unless a create-institution admin route is added later).
+
+--- Students ---
+
+POST /admin/students/upload
+  Auth: admin + permission "students_create"
+  Content-Type: multipart/form-data
+  Form fields:
+    excel_file: file (.xlsx/.xlsm required)
+    certificates: file[] (optional, .pdf/.jpg/.jpeg, or .zip containing them)
+    batch_year: string (required)
+    institution_id: string (required) - which institution the upload is for
+  Response:
+    {
+      inserted_count: int,
+      students: [student document, ...],
+      errors: [{ row: int, reason: str }, ...],
+      unmatched_certificates: [filename, ...]
+    }
+  Matching logic: each excel row is matched to an uploaded certificate file
+  by roll_no first, then certificate_no (filename stem, case/space
+  normalized). Rows failing validation, duplicates in-file, or duplicates
+  already in DB (same roll_no + batch_year) are skipped and reported in
+  "errors", not inserted.
+
+GET /admin/students/institution/{institution_name}
+  Auth: admin + permission "students_view"
+  Response: array of student documents for that institution.
+
+GET /admin/students/institution/{institution_name}/year/{year}
+  Auth: admin + permission "students_view"
+  Response: array of student documents where month_year_pass contains {year}.
+
+GET /admin/students/institution/{institution_name}/batch/{batch_year}
+  Auth: admin + permission "students_view"
+  Response: array of student documents for that institution + batch_year.
+
+GET /admin/students/stats/{institution_id}
+  Auth: admin + permission "students_view"
+  Response:
+    {
+      institution_id, total_students: int,
+      by_year: { "<year>": count, ... },
+      by_department: { "<course_or_Acadamic>": count, ... },
+      by_grade: { "<grade>": count, ... },
+      by_batch_year: { "<batch_year>": count, ... }
+    }
+
+GET /admin/students/{roll_no}
+  Auth: admin + permission "students_view"
+  Response: single student document.
+  Errors: 404 not found.
+
+PATCH /admin/students/{roll_no}/certificate
+  Auth: admin + permission "students_update"
+  Content-Type: multipart/form-data
+  Form fields: certificate: file (.pdf/.jpg/.jpeg, max size env
+    CERTIFICATE_MAX_SIZE_MB, default 10MB)
+  Response: updated student document (new certificate_url).
+  Errors: 404 student not found, 400 invalid file / too large / empty.
+
+PATCH /admin/students/{roll_no}
+  Auth: admin + permission "students_update"
+  Body (UpdateStudents, all optional):
+    certificate_no, roll_no, student_name, surname_lastName,
+    course_or_Acadamic, month_year_pass, grade, batch_year, certificate_url
+  Response: updated student document.
+  Errors: 400 no fields, 404 not found, 409 conflict if new
+    (roll_no + batch_year) combo already exists on another student.
+
+DELETE /admin/students/{roll_no}
+  Auth: admin + permission "students_delete"
+  Response: 204 No Content.
+  Errors: 404 not found.
+
+
+========================================================================
+3) INSTITUTION ENDPOINTS  -  prefix: /institutions
+========================================================================
+
+POST /institutions/register
+  Auth: none
+  Body (Register):
+    { name, email_id, institution_name, institutional_code, gst_number,
+      postal_code?, city, state?, country, mobile_no?, password(min 8),
+      superadmin_status? (default "Pending"), status? (default true) }
+  Response (201): created institution document, with otp_verified=false.
+  Notes: self-registered institutions start as superadmin_status="Pending"
+    and must be approved by a superadmin (via
+    PATCH /superadmin/superadmin-update-institution/{id} with
+    superadmin_status="Approved") before they can be treated as active
+    (see GET /institutions/superadmin_status below). Sends OTP email; if
+    anything fails after insert, the just-created record is rolled back
+    (deleted).
+
+POST /institutions/login
+  Auth: none
+  Body (Login): { email_id: EmailStr, password: str(min 8) }
+  Response: { access_token, token_type: "bearer" }
+  Errors:
+    401 invalid credentials
+    403 "Email OTP verification required" (otp_verified is false)
+    403 "Your Account is Inactive. Please Contact Admin or Superadmin"
+        (status field is false)
+
+GET /institutions/superadmin_status
+  Auth: institution (self)
+  Response: full institution document, but ONLY if
+    institution.superadmin_status == "Approved".
+  Errors: 404 not found, 403 "Institution is not approved" otherwise.
+  Purpose: frontend should call this after login to gate access to the
+    institution dashboard until a superadmin has approved the account.
+
+POST /institutions/password-reset/request
+  Auth: none
+  Body: { email_id: EmailStr }
+  Response: { message: "Password reset OTP sent" }
+
+POST /institutions/password-reset/confirm
+  Auth: none
+  Body: { email_id: EmailStr, otp: str(6 digits), new_password: str(min 8) }
+  Response: { message: "Password reset successfully" }
+
+POST /institutions/verify-otp
+  Auth: none
+  Body (VerifyOTP): { email_id: EmailStr, otp: str(6 digits) }
+  Response: institution document (otp_verified set true).
+
+GET /institutions/institution/{institution_id}
+  Auth: institution (any logged-in institution - NOT restricted to self;
+    no ownership check is performed on this particular GET)
+  Response: institution document.
+  Errors: 404 not found.
+
+PATCH /institutions/update-institution/{institution_id}
+  Auth: institution (self only - 403 if institution_id != own)
+  Body (UpdateBase) - same fields as superadmin's update-institution,
+    including the ability to set your own "status"/"superadmin_status"
+    (note: nothing server-side currently blocks an institution from
+    setting its own superadmin_status back to "Approved" - flag for
+    backend hardening, not required for frontend work).
+  Response: updated institution document.
+  Errors: 400 no fields, 403 not self, 404 not found.
+
+DELETE /institutions/delete-institution/{institution_id}
+  Auth: institution (self only - 403 if not self)
+  Response: 204 No Content.
+  Errors: 404 not found.
+
+PATCH /institutions/students/{roll_no}/certificate
+  Auth: institution (self - scoped to own institution_id)
+  Content-Type: multipart/form-data
+  Form fields: certificate: file (.pdf/.jpg/.jpeg, size-limited)
+  Response: updated student document.
+  Errors: 404 if student not found under this institution.
+
+  NOTE: institutions do NOT have their own routes for listing/creating/
+  updating/deleting students under the /institutions prefix - for those
+  they use the shared /students/* routes below (get_current_principal
+  accepts institution tokens too, scoped by institution_id).
+
+
+========================================================================
+4) STUDENTS ENDPOINTS (shared)  -  prefix: /students
+========================================================================
+  Used directly by institution accounts for self-service, and internally
+  re-used (imported) by both /admin/students/* and /superadmin/students/*
+  wrappers described above.
+
+POST /students/upload
+  Auth: institution (get_current_principal accepts institution role)
+  Content-Type: multipart/form-data
+  Form fields:
+    excel_file: file (.xlsx/.xlsm, required)
+    certificates: file[] (optional; .pdf/.jpg/.jpeg or .zip of them)
+    batch_year: string (required, cannot be a future year)
+  Response: same shape as admin upload:
+    { inserted_count, students: [...], errors: [...], unmatched_certificates: [...] }
+  Excel column detection is header-based (case/whitespace insensitive),
+  recognizes columns containing: "roll" -> roll_no, "certificate"/"cert no"
+  -> certificate_no, "sur"/"last name" -> surname_lastName,
+  "course"/"academic" -> course_or_Acadamic, "month"/"year" ->
+  month_year_pass, "grade" -> grade, "name" (leading) -> student_name.
+  roll_no and certificate_no columns are REQUIRED in the sheet.
+  Certificate matching: by filename stem == roll_no first, else ==
+  certificate_no (case/space normalized).
+  Server also generates: student_id (uuid), certificate_id (8-digit
+  numeric id), institution_id/institution_name (from the caller's own
+  institution).
+
+GET /students/institution/{institution_name}
+  Auth: institution (must be own institution_name, else 403)
+  Response: array of student documents.
+
+GET /students/institution/{institution_name}/year/{year}
+  Auth: institution (own institution only)
+  Response: array of student documents for that year.
+
+GET /students/institution/{institution_name}/batch/{batch_year}
+  Auth: institution (own institution only)
+  Response: array of student documents for that batch.
+
+GET /students/stats/{institution_id}
+  Auth: institution (own institution_id only, else 403)
+  Response:
+    { institution_id, total_students, by_year, by_department, by_grade,
+      by_batch_year }
+  (Uses "Unspecified"/"Unknown" bucket names for missing values - slightly
+  different aggregation implementation than the admin/superadmin stats
+  endpoints but same output shape.)
+
+GET /students/{identifier}
+  Auth: NONE - PUBLIC ENDPOINT
+  Purpose: public certificate verification lookup. Matches identifier
+  against roll_no, certificate_no, OR certificate_id.
+  Response: array of matching student documents (can be more than one if
+    same roll_no reused across batch years).
+  Errors: 404 if nothing matches.
+  *** Use this for any public "verify a certificate" page. ***
+
+PATCH /students/{roll_no}
+  Auth: institution (own institution only, checked against the existing
+    student's institution_id - 403 if mismatched)
+  Body (UpdateStudents, all optional) - same fields as admin/superadmin
+    version.
+  Response: updated student document.
+  Errors: 400 no fields, 404 not found, 403 not own institution's
+    student, 409 conflict on (roll_no, batch_year).
+
+DELETE /students/{roll_no}
+  Auth: institution (own institution only)
+  Response: 204 No Content.
+  Errors: 404 not found, 403 not own institution's student.
+
+
+========================================================================
+5) COMMON DOCUMENT SHAPES (what GET/PATCH responses look like)
+========================================================================
+
+Institution document (schemas/institutions_schemas.py):
+  {
+    institution_id, name, email_id, institution_name, gst_number,
+    postal_code, city, state, country, mobile_no,
+    otp_verified: bool, superadmin_status: "Approved"|"Pending"|"Suspended",
+    status: bool
+  }
+  NOTE: institutional_code is stored on the model/DB but is NOT included
+  in this response shape - frontend cannot currently read it back from any
+  institution GET/list endpoint (only sets it on register/create/update).
+
+Student document (schemas/students_schemas.py):
+  {
+    student_id, institution_id, institution_name, certificate_no,
+    roll_no, student_name, surname_lastName, course_or_Acadamic,
+    month_year_pass, grade, batch_year, certificate_url, certificate_id
+  }
+
+Admin document (schemas/admin_schemas.py) - returned by
+  GET /superadmin/admins and PATCH /superadmin/admin/{id}:
+  {
+    admin_id, admin_loginId, admin_name, email, mobilenumber,
+    password, superadmin_id, role
+  }
+  *** Does not yet expose access_level / permissions / status - see gap
+  noted in section 1. Frontend permission-editing UI has nothing to read
+  from this endpoint today; it will need a backend schema change first. ***
+
+
+========================================================================
+6) WHAT CHANGED IN THIS UPDATE (uncommitted working-tree diff)
+========================================================================
+Files touched: models/admin_model.py, routers/admin_router.py
+
+1. Admin model gained:
+   - access_level: "full" | "custom" (default "custom")
+   - permissions: { students_view/create/update/delete,
+                    institutions_view/create/update/delete } (all default false)
+   - status: bool (default true)
+   UpdateAdmin gained the same three fields, all optional.
+
+2. admin_router.py gained a require_permission(permission_name)
+   dependency. Every /admin/* route (except /admin/login) now requires
+   the caller to either have access_level == "full", or have the specific
+   permission flag true, otherwise 403.
+   Permission keys currently wired up to routes:
+     institutions_view, institutions_update, institutions_delete,
+     students_view, students_create, students_update, students_delete
+   (institutions_create is defined in the model but not used by any route)
+
+3. TWO BACKEND BUGS block this feature from working end-to-end right now
+   (frontend team should know before building UI against it, and these
+   should go back to backend for a fix):
+
+   BUG A - permissions/access_level never reach the JWT:
+     admin_login() builds the token via create_access_token(user_id, role,
+     email) only. access_level/permissions are never embedded, and
+     require_permission() reads them off the decoded token
+     (current_admin.get("access_level"/"permissions")). Result: EVERY
+     admin, regardless of DB configuration, currently gets 403 on every
+     permission-gated route. Needs either: embed access_level/permissions
+     into the JWT at login, or have require_permission() fetch the admin
+     record from the DB by sub/admin id.
+
+   BUG B - permissions/access_level/status never get saved:
+     superadmin's POST /superadmin/admin-creation accepts access_level,
+     permissions, and status in the request body (via the Admin model)
+     but the insert payload only writes admin_id, admin_loginId,
+     admin_name, email, mobilenumber, password, superadmin_id, role to
+     the DB - the three new fields are silently dropped.
+
+   GAP - admin document responses (schemas/admin_schemas.py) don't return
+     access_level/permissions/status at all, so even after A and B are
+     fixed, the frontend has no endpoint to read an admin's current
+     permission set (needed for an "edit permissions" screen showing
+     current state). GET /superadmin/admins and PATCH
+     /superadmin/admin/{admin_id} both need this schema updated.
+
+RECOMMENDATION FOR FRONTEND WORK:
+  - You can safely build the "Create Admin" and "Edit Admin" forms now
+    to submit access_level + permissions + status (the request shape is
+    final), and the "institutions_view/create/update/delete" and
+    "students_view/create/update/delete" checkbox set for a permissions
+    UI.
+  - Do NOT expect the permission enforcement (403 gating) or the "view
+    current permissions" read-back to work until Bug A, Bug B, and the
+    schema GAP above are fixed backend-side.

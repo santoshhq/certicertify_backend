@@ -14,7 +14,7 @@ from uuid import uuid4
 from pathlib import Path
 import os
 import secrets
-from schemas.superadmin_schemas import single_document
+from schemas.superadmin_schemas import single_document,profile_info
 from schemas.institutions_schemas import get_all_documents, get_single_document
 from schemas.admin_schemas import get_all_admin_doc, single_admin_doc
 from services.email_service import admin_account_created, superadmin_account_verify, superadmin_password_reset
@@ -25,7 +25,7 @@ from config.db_collections import admins_collection
 from models.admin_model import Admin, UpdateAdmin
 from models.students_models import UpdateStudents
 from schemas.students_schemas import get_all_documents as get_all_student_documents, get_single_document as get_single_student_document
-from routers.students_router import upload_students
+from routers.students_router import upload_students, create_single_student
 from models.institutions_model import Register
 superadmin_router=APIRouter(prefix="/superadmin",tags=["Super Admin"])
 
@@ -43,6 +43,45 @@ def _as_aware_utc(value: datetime | None) -> datetime | None:
 	if value.tzinfo is None:
 		return value.replace(tzinfo=timezone.utc)
 	return value
+
+@superadmin_router.get("/profile-info")
+async def superadmin_profileInfo(current_superadmin:dict=Depends(get_current_superadmin)):
+    try:
+        account_info=await superadmin_collection.find_one({"superadmin_id":current_superadmin.get("sub")})
+        return profile_info(account_info)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@superadmin_router.patch("/profile-info")
+async def superadmin_update_profile(
+    requests: UpdateSuperAdmin,
+    current_superadmin: dict = Depends(get_current_superadmin),
+):
+    try:
+        updates = requests.model_dump(exclude_unset=True)
+        # Password changes go through the OTP reset flow; email is the login identity.
+        updates.pop("password", None)
+        updates.pop("email", None)
+        updates = {k: v for k, v in updates.items() if v is not None and str(v).strip()}
+        if not updates:
+            raise HTTPException(status_code=400, detail="At least one of fullname or mobilenumber is required")
+        result = await superadmin_collection.update_one(
+            {"superadmin_id": current_superadmin.get("sub")},
+            {"$set": updates},
+        )
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Superadmin not found")
+        account_info = await superadmin_collection.find_one({"superadmin_id": current_superadmin.get("sub")})
+        return profile_info(account_info)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Unable to update profile") from e
+
+
+
+
 
 
 @superadmin_router.post("/register")
@@ -233,7 +272,7 @@ async def delete_institution(institution_id: str, principal: dict = Depends(get_
 @superadmin_router.post("/admin-creation")
 async def add_new_admin(requests:Admin, current_superadmin:dict=Depends(get_current_superadmin)):
 	try:
-		document = requests.model_dump()
+		document = requests.model_dump(mode="json")
 		payload = {
 			"admin_id": str(uuid4()),
 			"admin_loginId": document.get("admin_userId"),
@@ -241,6 +280,9 @@ async def add_new_admin(requests:Admin, current_superadmin:dict=Depends(get_curr
 			"email": document.get("email"),
 			"mobilenumber": document.get("mobilenumber"),
 			"password": document.get("password"),
+			"access_level": document.get("access_level"),
+			"permissions": document.get("permissions"),
+			"status": document.get("status", True),
 			"superadmin_id": current_superadmin["sub"],
 			"role": "admin",
 		}
@@ -284,7 +326,7 @@ async def update_admin(
 	current_superadmin: dict = Depends(get_current_superadmin),
 ):
 	try:
-		updates = admin.model_dump(exclude_unset=True)
+		updates = admin.model_dump(exclude_unset=True, mode="json")
 		if not updates:
 			raise HTTPException(
 				status_code=status.HTTP_400_BAD_REQUEST,
@@ -366,6 +408,8 @@ async def add_instution(
 			"name": document.get("name"),
 			"email_id": document.get("email_id"),
 			"institution_name": document.get("institution_name"),
+			"institutional_code": document.get("institutional_code"),
+			"gst_number": document.get("gst_number"),
 			"postal_code": document.get("postal_code"),
 			"city": document.get("city"),
 			"state": document.get("state"),
@@ -376,7 +420,8 @@ async def add_instution(
 			"otp_verified": True,
 			"role": "institution",
 			"unique_id": generate_id(8),
-			"status": InstitutionStatus.APPROVED,
+			"superadmin_status": InstitutionStatus.APPROVED,
+			"status": True,
 		}
 		await institutions_collection.insert_one(payload)
 		return get_single_document(payload)
@@ -407,6 +452,39 @@ async def superadmin_upload_students(
 		raise
 	except Exception as error:
 		raise _internal_server_error(error) from error
+
+@superadmin_router.post("/students", status_code=status.HTTP_201_CREATED)
+async def superadmin_add_student(
+	institution_id: str = Form(...),
+	batch_year: str = Form(...),
+	certificate_no: str = Form(...),
+	roll_no: str = Form(...),
+	student_name: str = Form(...),
+	surname_lastName: str = Form(default=""),
+	course_or_Acadamic: str = Form(...),
+	month_year_pass: str = Form(...),
+	grade: str = Form(default=""),
+	certificate: UploadFile = File(...),
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	try:
+		return await create_single_student(
+			principal={"role": "superadmin", "institution_id": institution_id},
+			batch_year=batch_year,
+			certificate_no=certificate_no,
+			roll_no=roll_no,
+			student_name=student_name,
+			surname_lastName=surname_lastName,
+			course_or_Acadamic=course_or_Acadamic,
+			month_year_pass=month_year_pass,
+			grade=grade,
+			certificate=certificate,
+		)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
 
 def _student_key(value: str) -> str:
 	return " ".join(str(value).strip().upper().split())

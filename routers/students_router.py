@@ -161,6 +161,11 @@ async def upload_students(
 			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Batch year cannot be in the future")
 		if not excel_file.filename or not excel_file.filename.lower().endswith((".xlsx", ".xlsm")):
 			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only .xlsx Excel files are supported")
+		if not any(certificate.filename for certificate in certificates):
+			raise HTTPException(
+				status_code=status.HTTP_400_BAD_REQUEST,
+				detail="Certificates are required: attach PDF/JPG files or a .zip alongside the Excel roster",
+			)
 
 		institution_id = principal.get("institution_id")
 		institution = await institutions_collection.find_one({"institution_id": institution_id})
@@ -195,6 +200,11 @@ async def upload_students(
 			)
 
 		expanded_certificates = await _expand_certificate_uploads(certificates)
+		if not expanded_certificates:
+			raise HTTPException(
+				status_code=status.HTTP_400_BAD_REQUEST,
+				detail="No PDF or JPG certificates were found in the uploaded files",
+			)
 
 		certificates_by_identifier = {
 			_normalize_key(Path(certificate.filename).stem): certificate
@@ -330,6 +340,132 @@ async def upload_students(
 		raise _internal_server_error(error) from error
 
 
+async def create_single_student(
+	*,
+	principal: dict,
+	batch_year: str,
+	certificate_no: str,
+	roll_no: str,
+	student_name: str,
+	surname_lastName: str,
+	course_or_Acadamic: str,
+	month_year_pass: str,
+	grade: str,
+	certificate: UploadFile,
+) -> dict:
+	"""Insert one student. The certificate filename must match the roll number or certificate number."""
+	batch_year = _normalize_key(batch_year)
+	if not batch_year:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Batch year is required")
+	batch_year_value = _extract_year(batch_year)
+	if batch_year_value is None or batch_year_value > date.today().year:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Batch year cannot be in the future")
+
+	roll_no = _normalize_key(roll_no)
+	certificate_no = _normalize_key(certificate_no)
+	student_name = (student_name or "").strip()
+	course_or_Acadamic = (course_or_Acadamic or "").strip()
+	month_year_pass = (month_year_pass or "").strip()
+	missing = [
+		name
+		for name, value in (
+			("roll_no", roll_no),
+			("certificate_no", certificate_no),
+			("student_name", student_name),
+			("course_or_Acadamic", course_or_Acadamic),
+			("month_year_pass", month_year_pass),
+		)
+		if not value
+	]
+	if missing:
+		raise HTTPException(
+			status_code=status.HTTP_400_BAD_REQUEST,
+			detail=f"Missing required field(s): {', '.join(missing)}",
+		)
+	passout_year = _extract_year(month_year_pass)
+	if passout_year is None or passout_year > date.today().year:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Passout year cannot be in the future")
+
+	if not certificate.filename:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Certificate file is required")
+	extension = certificate.filename.rsplit(".", 1)[-1].lower() if "." in certificate.filename else ""
+	if extension not in ALLOWED_CERTIFICATE_EXTENSIONS:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Certificate must be a PDF or JPG file")
+	stem = _normalize_key(Path(certificate.filename).stem)
+	if stem not in (roll_no, certificate_no):
+		raise HTTPException(
+			status_code=status.HTTP_400_BAD_REQUEST,
+			detail=(
+				f"Certificate filename '{certificate.filename}' must match the roll number "
+				f"'{roll_no}' or certificate number '{certificate_no}'"
+			),
+		)
+
+	institution_id = principal.get("institution_id")
+	institution = await institutions_collection.find_one({"institution_id": institution_id})
+	if institution is None:
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Institution not found")
+	institution_name = institution["institution_name"]
+
+	existing = await students_collections.find_one({"roll_no": roll_no, "batch_year": batch_year})
+	if existing is not None:
+		raise HTTPException(
+			status_code=status.HTTP_409_CONFLICT,
+			detail=f"Student with roll number '{roll_no}' and batch year '{batch_year}' already exists",
+		)
+
+	certificate_url = upload_student_certificate(certificate, institution_name, roll_no)
+	document = {
+		"student_id": str(uuid4()),
+		"institution_id": institution_id,
+		"institution_name": institution_name,
+		"certificate_no": certificate_no,
+		"roll_no": roll_no,
+		"student_name": student_name,
+		"surname_lastName": (surname_lastName or "").strip(),
+		"course_or_Acadamic": course_or_Acadamic,
+		"month_year_pass": month_year_pass,
+		"grade": (grade or "").strip(),
+		"batch_year": batch_year,
+		"certificate_url": certificate_url,
+		"certificate_id": generate_numeric_id(8),
+	}
+	await students_collections.insert_one(document)
+	return get_single_document(document)
+
+
+@students_router.post("", status_code=status.HTTP_201_CREATED)
+async def add_student(
+	batch_year: str = Form(...),
+	certificate_no: str = Form(...),
+	roll_no: str = Form(...),
+	student_name: str = Form(...),
+	surname_lastName: str = Form(default=""),
+	course_or_Acadamic: str = Form(...),
+	month_year_pass: str = Form(...),
+	grade: str = Form(default=""),
+	certificate: UploadFile = File(...),
+	principal: dict = Depends(get_current_principal),
+):
+	try:
+		return await create_single_student(
+			principal=principal,
+			batch_year=batch_year,
+			certificate_no=certificate_no,
+			roll_no=roll_no,
+			student_name=student_name,
+			surname_lastName=surname_lastName,
+			course_or_Acadamic=course_or_Acadamic,
+			month_year_pass=month_year_pass,
+			grade=grade,
+			certificate=certificate,
+		)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
 @students_router.get("/institution/{institution_name}")
 async def get_students_by_institution(institution_name: str, principal: dict = Depends(get_current_principal)):
 	try:
@@ -428,26 +564,112 @@ async def get_student_stats(institution_id: str, principal: dict = Depends(get_c
 		raise _internal_server_error(error) from error
 
 
-@students_router.get("/{identifier}")
-async def get_student(identifier: str):
+@students_router.get("/search")
+async def suggest_students(q: str = "", limit: int = 8):
+	"""Public typeahead: prefix-match roll number / certificate number / certificate ID.
+
+	Returns only basic, non-sensitive fields, and only for approved institutions.
+	"""
 	try:
-		search_value = _normalize_key(identifier)
-		documents = await students_collections.find(
+		search_value = _normalize_key(q)
+		if len(search_value) < 2:
+			return []
+		limit = max(1, min(limit, 15))
+		prefix = {"$regex": "^" + re.escape(search_value)}
+
+		pipeline = [
 			{
-				"$or": [
-					{"roll_no": search_value},
-					{"certificate_no": search_value},
-					{"certificate_id": search_value},
-				]
-			}
-		).to_list(length=None)
-		if not documents:
-			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
-		return get_all_documents(documents)
-	except HTTPException:
-		raise
+				"$match": {
+					"$or": [
+						{"roll_no": prefix},
+						{"certificate_no": prefix},
+						{"certificate_id": prefix},
+					]
+				}
+			},
+			{
+				"$lookup": {
+					"from": institutions_collection.name,
+					"localField": "institution_id",
+					"foreignField": "institution_id",
+					"as": "institution",
+				}
+			},
+			{"$unwind": "$institution"},
+			{"$match": {"institution.superadmin_status": "Approved"}},
+			{"$sort": {"roll_no": 1, "batch_year": -1}},
+			{"$limit": limit},
+			{
+				"$project": {
+					"_id": 0,
+					"student_id": 1,
+					"roll_no": 1,
+					"certificate_no": 1,
+					"certificate_id": 1,
+					"student_name": 1,
+					"surname_lastName": 1,
+					"institution_name": 1,
+					"course_or_Acadamic": 1,
+					"batch_year": 1,
+				}
+			},
+		]
+		return await students_collections.aggregate(pipeline).to_list(length=limit)
 	except Exception as error:
 		raise _internal_server_error(error) from error
+
+
+@students_router.get("/{identifier}")
+async def get_student(identifier: str):
+
+    try:
+        search_value = _normalize_key(identifier)
+
+        pipeline = [
+            {
+                "$match": {
+                    "$or": [
+                        {"roll_no": search_value},
+                        {"certificate_no": search_value},
+                        {"certificate_id": search_value},
+                    ]
+                }
+            },
+            {
+                "$lookup": {
+                    "from": institutions_collection.name,
+                    "localField": "institution_id",
+                    "foreignField": "institution_id",
+                    "as": "institution"
+                }
+            },
+            {
+                "$unwind": "$institution"
+            },
+            {
+                "$match": {
+                    "institution.superadmin_status": "Approved"
+                }
+            }
+        ]
+
+        documents = await students_collections.aggregate(
+            pipeline
+        ).to_list(length=None)
+
+        if not documents:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Student not found"
+            )
+
+        return get_all_documents(documents)
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        raise _internal_server_error(error) from error
 
 
 

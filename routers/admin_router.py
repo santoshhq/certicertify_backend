@@ -6,7 +6,7 @@ from schemas.institutions_schemas import get_all_documents, get_single_document
 from schemas.students_schemas import get_all_documents as get_all_student_documents, get_single_document as get_single_student_document
 from fastapi import APIRouter, File, Form, HTTPException, Depends, UploadFile, status
 from utils.jwt_token_auth import get_current_admin, create_access_token
-from routers.students_router import upload_students
+from routers.students_router import upload_students, create_single_student
 from services.aws_s3 import upload_student_certificate
 from routers.superadmin_routers import _read_replacement_certificate
 
@@ -19,7 +19,20 @@ def _internal_server_error(error: Exception) -> HTTPException:
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         detail="Unable to process admin request",
     )
-#Admin Permission Validation 
+    
+    
+#Admin Permission Validation
+async def _load_admin_record(current_admin: dict) -> dict:
+    # Permissions live in the DB (not the JWT) so superadmin edits apply immediately.
+    record = await admins_collection.find_one({"admin_id": current_admin.get("sub")})
+    if not record:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Admin account not found")
+    if record.get("status", True) is False:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Your Account is Inactive. Please Contact Superadmin",
+        )
+    return record
 
 
 def require_permission(permission: str):
@@ -27,13 +40,15 @@ def require_permission(permission: str):
     async def permission_checker(
         current_admin: dict = Depends(get_current_admin)
     ):
-        access_level = current_admin.get("access_level")
+        record = await _load_admin_record(current_admin)
+        access_level = record.get("access_level") or "custom"
+        permissions = record.get("permissions") or {}
+        # Expose the live access level to route handlers that need finer checks.
+        current_admin = {**current_admin, "access_level": access_level, "permissions": permissions}
 
         # Full-control admin
         if access_level == "full":
             return current_admin
-
-        permissions = current_admin.get("permissions", {})
 
         if permissions.get(permission) is not True:
             raise HTTPException(
@@ -45,6 +60,20 @@ def require_permission(permission: str):
 
     return permission_checker
 
+
+@admin_routers.get("/me")
+async def admin_me(current_admin: dict = Depends(get_current_admin)):
+    record = await _load_admin_record(current_admin)
+    return {
+        "admin_id": record.get("admin_id"),
+        "admin_loginId": record.get("admin_loginId"),
+        "admin_name": record.get("admin_name"),
+        "email": record.get("email"),
+        "access_level": record.get("access_level") or "custom",
+        "permissions": record.get("permissions") or {},
+        "status": record.get("status", True),
+    }
+
 @admin_routers.post("/login")
 async def admin_login(requests:Login):
     try:
@@ -54,6 +83,10 @@ async def admin_login(requests:Login):
             raise HTTPException(status_code=404, detail="Admin Account Not Found !")
         if check_acc.get("password")!= document.get("password"):
             raise HTTPException(status_code=400, detail="Invalid admin_userId and passowrd")
+        
+        if check_acc.get("status", True) is False:
+            raise HTTPException(status_code=400, detail="Your Account is Inactive. Please Contact Superadmin")
+
         token=create_access_token(
             user_id=check_acc.get("admin_id"),
             role=check_acc.get("role"),
@@ -88,7 +121,11 @@ async def update_institution(
     current_admin: dict = Depends(require_permission("institutions_update")),
 ):
     try:
-        updates = institution.model_dump(exclude_unset=True)
+        updates = institution.model_dump(exclude_unset=True, mode="json")
+        # Account approval/suspension needs full control; custom-permission admins can't change it.
+        if current_admin.get("access_level") != "full":
+            updates.pop("superadmin_status", None)
+            updates.pop("status", None)
         if not updates:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one field is required")
 
@@ -136,6 +173,39 @@ async def admin_upload_students(
             certificates=certificates,
             batch_year=batch_year,
             principal={"role": "admin", "institution_id": institution_id},
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise _internal_server_error(error) from error
+
+
+@admin_routers.post("/students", status_code=status.HTTP_201_CREATED)
+async def admin_add_student(
+    institution_id: str = Form(...),
+    batch_year: str = Form(...),
+    certificate_no: str = Form(...),
+    roll_no: str = Form(...),
+    student_name: str = Form(...),
+    surname_lastName: str = Form(default=""),
+    course_or_Acadamic: str = Form(...),
+    month_year_pass: str = Form(...),
+    grade: str = Form(default=""),
+    certificate: UploadFile = File(...),
+    current_admin: dict = Depends(require_permission("students_create")),
+):
+    try:
+        return await create_single_student(
+            principal={"role": "admin", "institution_id": institution_id},
+            batch_year=batch_year,
+            certificate_no=certificate_no,
+            roll_no=roll_no,
+            student_name=student_name,
+            surname_lastName=surname_lastName,
+            course_or_Acadamic=course_or_Acadamic,
+            month_year_pass=month_year_pass,
+            grade=grade,
+            certificate=certificate,
         )
     except HTTPException:
         raise

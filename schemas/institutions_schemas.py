@@ -8,7 +8,7 @@ def get_single_document(document):
         "name": document.get("name"),
         "email_id": document.get("email_id"),
         "institution_name": document.get("institution_name"),
-        "institution_name":document.get("institution_name"),
+        "institutional_code": document.get("institutional_code"),
         "gst_number":document.get("gst_number"),
         "postal_code": document.get("postal_code"),
         "city": document.get("city"),

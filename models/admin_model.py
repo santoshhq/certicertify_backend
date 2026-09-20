@@ -31,7 +31,7 @@ class Admin(BaseModel):
     permissions: AdminPermissions = Field(
         default_factory=AdminPermissions
     )
-
+    status:bool=Field(default=True)
 
 class UpdateAdmin(BaseModel):
     admin_name: Optional[str] = Field(default=None, min_length=1)
@@ -48,7 +48,7 @@ class UpdateAdmin(BaseModel):
     )
     access_level: Optional[AdminAccessLevel] = None
     permissions: Optional[AdminPermissions] = None
-
+    status: Optional[bool] = None
 
 class Login(BaseModel):
     admin_loginId: str = Field(...)
