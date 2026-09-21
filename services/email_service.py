@@ -12,16 +12,23 @@ load_dotenv()
 LOGO_URL = "https://certicertify.s3.ap-south-1.amazonaws.com/certicertify_logo.png"
 
 
-def _smtp_settings() -> tuple[str, int, str, str, str]:
-        host = os.getenv("SMTP_HOST")
-        port = int(os.getenv("SMTP_PORT", "465"))
-        sender = os.getenv("SMTP_EMAIL")
-        password = os.getenv("SMTP_PASSWORD")
-    
-        if not host or not sender or not password:
-                raise RuntimeError("SMTP_HOST, SMTP_EMAIL, and SMTP_PASSWORD must be configured")
-    
-        return host, port, sender, sender, password
+def _smtp_settings() -> tuple[str, int, str, str, str, str]:
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "465"))
+
+    username = os.getenv("SMTP_USERNAME")
+    password = os.getenv("SMTP_PASSWORD")
+
+    from_email = os.getenv("SMTP_FROM_EMAIL")
+    from_name = os.getenv("SMTP_FROM_NAME", "CertiCertify")
+
+    if not host or not username or not password or not from_email:
+        raise RuntimeError(
+            "SMTP_HOST, SMTP_USERNAME, SMTP_PASSWORD, and SMTP_FROM_EMAIL "
+            "must be configured"
+        )
+
+    return host, port, username, from_email, from_name, password
     
 def _send_html_email_sync(
         recipient: str,
@@ -29,7 +36,7 @@ def _send_html_email_sync(
         plain_text: str,
         html_content: str,
 ) -> None:
-        host, port, username, sender, password = _smtp_settings()
+        host, port, username, sender, from_name, password = _smtp_settings()
     
         message = EmailMessage()
         message["Subject"] = subject
@@ -38,9 +45,18 @@ def _send_html_email_sync(
         message.set_content(plain_text)
         message.add_alternative(html_content, subtype="html")
     
-        with smtplib.SMTP_SSL(host, port) as smtp:
-                smtp.login(username, password)
-                smtp.send_message(message)
+        # Port 465 uses implicit TLS; other ports (e.g. 587) use STARTTLS.
+        if port == 465:
+                with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
+                        smtp.login(username, password)
+                        smtp.send_message(message)
+        else:
+                with smtplib.SMTP(host, port, timeout=30) as smtp:
+                        smtp.ehlo()
+                        smtp.starttls()
+                        smtp.ehlo()
+                        smtp.login(username, password)
+                        smtp.send_message(message)
     
 def _email_layout(title: str, preheader: str, body_html: str) -> str:
         """Wrap email body HTML in the shared CertiCertify branded shell."""
