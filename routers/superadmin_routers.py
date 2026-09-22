@@ -12,12 +12,14 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, s
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from pathlib import Path
+import logging
 import os
 import secrets
+from zoneinfo import ZoneInfo
 from schemas.superadmin_schemas import single_document,profile_info
 from schemas.institutions_schemas import get_all_documents, get_single_document
 from schemas.admin_schemas import get_all_admin_doc, single_admin_doc
-from services.email_service import admin_account_created, superadmin_account_verify, superadmin_password_reset
+from services.email_service import admin_account_created, institution_email_changed, superadmin_account_verify, superadmin_password_reset
 from services.aws_s3 import upload_student_certificate
 from utils.jwt_token_auth import create_access_token, get_current_superadmin
 from models.institutions_model import InstitutionStatus, UpdateBase
@@ -28,6 +30,7 @@ from schemas.students_schemas import get_all_documents as get_all_student_docume
 from routers.students_router import upload_students, create_single_student
 from models.institutions_model import Register
 superadmin_router=APIRouter(prefix="/superadmin",tags=["Super Admin"])
+logger = logging.getLogger("uvicorn.error")
 
 
 def _internal_server_error(error: Exception) -> HTTPException:
@@ -238,6 +241,41 @@ async def update_institution(
 		updates = institution.model_dump(exclude_unset=True)
 		if not updates:
 			raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one field is required")
+
+		existing = await institutions_collection.find_one({"institution_id": institution_id})
+		if not existing:
+			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Institution not found")
+
+		# Capture the previous email before the write so the old address can be alerted.
+		old_email = str(existing.get("email_id") or "").strip()
+		new_email = str(updates.get("email_id") or "").strip()
+		email_changed = bool(new_email) and bool(old_email) and new_email.lower() != old_email.lower()
+
+		if email_changed:
+			# Alert the previous address BEFORE the account switches over, so a mail
+			# failure leaves the institution on its original, still-reachable email.
+			try:
+				await institution_email_changed(
+					recipient=old_email,
+					institution_name=(
+						existing.get("institution_name")
+						or existing.get("name")
+						or "your institution"
+					),
+					old_email=old_email,
+					new_email=new_email,
+					superadmin_email=principal.get("email"),
+					changed_at=datetime.now(
+						ZoneInfo("Asia/Kolkata")
+					).strftime("%d %b %Y, %I:%M %p IST"),
+				)	
+				logger.info("Institution %s: change alert accepted by SMTP for old address %s (%s -> %s)", institution_id, old_email, old_email, new_email)
+			except Exception as mail_error:
+				logger.error("Institution %s email change alert to %s failed: %s", institution_id, old_email, mail_error)
+				raise HTTPException(
+					status_code=status.HTTP_502_BAD_GATEWAY,
+					detail=f"Couldn't notify the current email address ({old_email}), so the email was not changed. Please try again.",
+				) from mail_error
 
 		result = await institutions_collection.update_one(
 			{"institution_id": institution_id},
@@ -714,3 +752,5 @@ async def superadmin_delete_student(
 	except Exception as error:
 		raise _internal_server_error(error) from error
 
+
+#-------------------------------------------------------------------------------------------

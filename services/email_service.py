@@ -2,6 +2,7 @@ import asyncio
 import os
 import smtplib
 from email.message import EmailMessage
+from email.utils import formataddr, formatdate, make_msgid
 from html import escape
 
 from dotenv import load_dotenv
@@ -40,8 +41,11 @@ def _send_html_email_sync(
     
         message = EmailMessage()
         message["Subject"] = subject
-        message["From"] = sender
+        message["From"] = formataddr((from_name, sender))
         message["To"] = recipient
+        # Gmail and other providers penalise or drop mail without Date/Message-ID.
+        message["Date"] = formatdate(localtime=True)
+        message["Message-ID"] = make_msgid(domain=sender.split("@")[-1])
         message.set_content(plain_text)
         message.add_alternative(html_content, subtype="html")
     
@@ -49,14 +53,19 @@ def _send_html_email_sync(
         if port == 465:
                 with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
                         smtp.login(username, password)
-                        smtp.send_message(message)
+                        refused = smtp.send_message(message)
         else:
                 with smtplib.SMTP(host, port, timeout=30) as smtp:
                         smtp.ehlo()
                         smtp.starttls()
                         smtp.ehlo()
                         smtp.login(username, password)
-                        smtp.send_message(message)
+                        refused = smtp.send_message(message)
+    
+        # send_message only raises when EVERY recipient is refused; a partial
+        # refusal comes back as a dict and would otherwise pass silently.
+        if refused:
+                raise smtplib.SMTPRecipientsRefused(refused)
     
 def _email_layout(title: str, preheader: str, body_html: str) -> str:
         """Wrap email body HTML in the shared CertiCertify branded shell."""
@@ -253,6 +262,280 @@ async def admin_account_created(
                                 html_content,
                 )
     
+async def institution_email_changed(
+    recipient: str,
+    institution_name: str,
+    old_email: str,
+    new_email: str,
+    superadmin_email: str | None = None,
+    changed_at: str | None = None,
+) -> None:
+    """
+    Notify the previous institution email address that a superadmin
+    changed the institution's registered email address.
+    """
+
+    # ---------------------------------------------------------
+    # Sanitize values for HTML
+    # ---------------------------------------------------------
+    safe_institution = escape(institution_name)
+    safe_old_email = escape(old_email)
+    safe_new_email = escape(new_email)
+
+    # ---------------------------------------------------------
+    # Superadmin contact information
+    # ---------------------------------------------------------
+    if superadmin_email:
+        safe_superadmin_email = escape(superadmin_email)
+
+        contact_html = (
+            f'<a href="mailto:{safe_superadmin_email}" '
+            f'style="color:#287a48;font-weight:bold;'
+            f'text-decoration:none;">'
+            f'{safe_superadmin_email}'
+            f'</a>'
+        )
+
+        contact_text = f" at {superadmin_email}"
+
+    else:
+        contact_html = "your CertiCertify super admin"
+        contact_text = ""
+
+    # ---------------------------------------------------------
+    # Changed-at row
+    # ---------------------------------------------------------
+    changed_row = ""
+
+    if changed_at:
+        safe_changed_at = escape(changed_at)
+
+        changed_row = f"""
+        <tr>
+            <td style="
+                padding:12px 0;
+                font-size:12px;
+                letter-spacing:1px;
+                text-transform:uppercase;
+                color:#4c765c;
+                font-weight:bold;
+            ">
+                Changed on
+            </td>
+
+            <td align="right" style="
+                padding:12px 0;
+                font-size:14px;
+                color:#173b2a;
+            ">
+                {safe_changed_at}
+            </td>
+        </tr>
+        """
+
+    # ---------------------------------------------------------
+    # HTML email body
+    # ---------------------------------------------------------
+    body = f"""
+    <p style="
+        margin:0 0 24px;
+        font-size:16px;
+        line-height:1.6;
+        color:#173b2a;
+        text-align:center;
+    ">
+        This is a security notification for the institution account
+        <strong>{safe_institution}</strong>.
+        The email address linked to this account has been changed
+        by a CertiCertify super admin.
+    </p>
+
+    <table
+        role="presentation"
+        width="100%"
+        cellspacing="0"
+        cellpadding="0"
+        border="0"
+        style="margin:0 0 24px;"
+    >
+        <tr>
+            <td style="
+                padding:8px 18px;
+                background:#effaf1;
+                border:1px solid #c5e5ce;
+                border-radius:10px;
+            ">
+
+                <table
+                    role="presentation"
+                    width="100%"
+                    cellspacing="0"
+                    cellpadding="0"
+                    border="0"
+                >
+
+                    <!-- Previous Email -->
+                    <tr>
+                        <td style="
+                            padding:12px 0;
+                            border-bottom:1px solid #c5e5ce;
+                            font-size:12px;
+                            letter-spacing:1px;
+                            text-transform:uppercase;
+                            color:#4c765c;
+                            font-weight:bold;
+                        ">
+                            Previous email
+                        </td>
+
+                        <td align="right" style="
+                            padding:12px 0;
+                            border-bottom:1px solid #c5e5ce;
+                            font-size:14px;
+                            color:#718579;
+                            text-decoration:line-through;
+                        ">
+                            {safe_old_email}
+                        </td>
+                    </tr>
+
+                    <!-- New Email -->
+                    <tr>
+                        <td style="
+                            padding:12px 0;
+                            border-bottom:1px solid #c5e5ce;
+                            font-size:12px;
+                            letter-spacing:1px;
+                            text-transform:uppercase;
+                            color:#4c765c;
+                            font-weight:bold;
+                        ">
+                            New email
+                        </td>
+
+                        <td align="right" style="
+                            padding:12px 0;
+                            border-bottom:1px solid #c5e5ce;
+                            font-size:16px;
+                            font-weight:bold;
+                            color:#287a48;
+                        ">
+                            {safe_new_email}
+                        </td>
+                    </tr>
+
+                    {changed_row}
+
+                </table>
+            </td>
+        </tr>
+    </table>
+
+    <!-- Information -->
+    <p style="
+        margin:0 0 16px;
+        font-size:15px;
+        line-height:1.6;
+        color:#173b2a;
+        text-align:center;
+    ">
+        Going forward, all sign-ins and account communications for this
+        institution will use the new email address.
+        This previous address will no longer receive account notifications.
+    </p>
+
+    <!-- Security Warning -->
+    <table
+        role="presentation"
+        width="100%"
+        cellspacing="0"
+        cellpadding="0"
+        border="0"
+        style="margin:0 0 24px;"
+    >
+        <tr>
+            <td style="
+                padding:16px 18px;
+                background:#fff7ed;
+                border:1px solid #fed7aa;
+                border-radius:10px;
+                font-size:14px;
+                line-height:1.6;
+                color:#7c2d12;
+                text-align:center;
+            ">
+                <strong>Did not expect this change?</strong>
+                <br />
+
+                If you did not request or authorise this update,
+                please contact the super admin immediately at
+                {contact_html}
+                so the account can be reviewed and secured.
+            </td>
+        </tr>
+    </table>
+
+    <p style="
+        margin:0 0 16px;
+        font-size:14px;
+        line-height:1.6;
+        color:#557061;
+        text-align:center;
+    ">
+        If you requested this change, no further action is required.
+    </p>
+    """
+
+    # ---------------------------------------------------------
+    # Wrap inside CertiCertify email layout
+    # ---------------------------------------------------------
+    html_content = _email_layout(
+        "Your institution email address was changed",
+        (
+            f"The email address for {institution_name} "
+            f"was changed to {new_email}."
+        ),
+        body,
+    )
+
+    # ---------------------------------------------------------
+    # Plain-text fallback
+    # ---------------------------------------------------------
+    plain_text = (
+        f"Security notification for the institution account "
+        f"{institution_name}.\n\n"
+
+        f"The email address linked to this account has been changed "
+        f"by a CertiCertify super admin.\n\n"
+
+        f"Previous email: {old_email}\n"
+        f"New email: {new_email}\n"
+    )
+
+    if changed_at:
+        plain_text += f"Changed on: {changed_at}\n"
+
+    plain_text += (
+        "\n"
+        "Going forward, all sign-ins and account communications for "
+        "this institution will use the new email address.\n\n"
+        "If you did not request or authorise this change, please "
+        f"contact the super admin immediately{contact_text} "
+        "so the account can be reviewed and secured.\n\n"
+        "If you requested this change, no further action is required."
+    )
+
+    # ---------------------------------------------------------
+    # Send email through existing SMTP helper
+    # ---------------------------------------------------------
+    await asyncio.to_thread(
+        _send_html_email_sync,
+        recipient,
+        f"Your CertiCertify institution email was changed",
+        plain_text,
+        html_content,
+    )
+
 async def send_otp_email(recipient: str, otp: str) -> None:
         """Backward-compatible alias for institution account verification."""
         await institution_account_verify(recipient, otp)

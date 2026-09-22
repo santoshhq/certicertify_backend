@@ -41,6 +41,8 @@ class UpdateBase(BaseModel):
     status: bool | None = None
 
 
+    
+    
 class VerifyOTP(BaseModel):
     email_id: EmailStr
     otp: str = Field(
