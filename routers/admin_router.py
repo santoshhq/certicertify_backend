@@ -377,6 +377,7 @@ async def admin_update_student(
             new_batch_year = updates.get("batch_year", existing.get("batch_year"))
             clash = await students_collections.find_one(
                 {
+                    "institution_id": existing.get("institution_id"),
                     "roll_no": new_roll_no,
                     "batch_year": new_batch_year,
                     "student_id": {"$ne": existing.get("student_id")},

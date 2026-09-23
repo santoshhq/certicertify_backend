@@ -260,7 +260,10 @@ async def upload_students(
 		existing_students_keys: set[tuple[str, str]] = set()
 		if valid_rows:
 			existing_students = await students_collections.find(
-				{"roll_no": {"$in": [roll_no for _, roll_no, _ in valid_rows]}},
+				{
+					"institution_id": institution_id,
+					"roll_no": {"$in": [roll_no for _, roll_no, _ in valid_rows]},
+				},
 				{"roll_no": 1, "batch_year": 1},
 			).to_list(length=None)
 			existing_students_keys = {
@@ -272,7 +275,10 @@ async def upload_students(
 				errors.append(
 					{
 						"row": row_index,
-						"reason": f"Student with roll number '{roll_no}' and batch year '{batch_year}' already exists, not added",
+						"reason": (
+							f"Student with roll number '{roll_no}' and batch year '{batch_year}' "
+							f"already exists for {institution_name}, not added"
+						),
 					}
 				)
 				continue
@@ -364,16 +370,20 @@ async def create_single_student(
 	roll_no = _normalize_key(roll_no)
 	certificate_no = _normalize_key(certificate_no)
 	student_name = (student_name or "").strip()
+	surname_lastName = (surname_lastName or "").strip()
 	course_or_Acadamic = (course_or_Acadamic or "").strip()
 	month_year_pass = (month_year_pass or "").strip()
+	grade = (grade or "").strip()
 	missing = [
 		name
 		for name, value in (
 			("roll_no", roll_no),
 			("certificate_no", certificate_no),
 			("student_name", student_name),
+			("surname_lastName", surname_lastName),
 			("course_or_Acadamic", course_or_Acadamic),
 			("month_year_pass", month_year_pass),
+			("grade", grade),
 		)
 		if not value
 	]
@@ -407,11 +417,16 @@ async def create_single_student(
 		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Institution not found")
 	institution_name = institution["institution_name"]
 
-	existing = await students_collections.find_one({"roll_no": roll_no, "batch_year": batch_year})
+	existing = await students_collections.find_one(
+		{"institution_id": institution_id, "roll_no": roll_no, "batch_year": batch_year}
+	)
 	if existing is not None:
 		raise HTTPException(
 			status_code=status.HTTP_409_CONFLICT,
-			detail=f"Student with roll number '{roll_no}' and batch year '{batch_year}' already exists",
+			detail=(
+				f"Student with roll number '{roll_no}' and batch year '{batch_year}' "
+				f"already exists for {institution_name}"
+			),
 		)
 
 	certificate_url = upload_student_certificate(certificate, institution_name, roll_no)
@@ -422,10 +437,10 @@ async def create_single_student(
 		"certificate_no": certificate_no,
 		"roll_no": roll_no,
 		"student_name": student_name,
-		"surname_lastName": (surname_lastName or "").strip(),
+		"surname_lastName": surname_lastName,
 		"course_or_Acadamic": course_or_Acadamic,
 		"month_year_pass": month_year_pass,
-		"grade": (grade or "").strip(),
+		"grade": grade,
 		"batch_year": batch_year,
 		"certificate_url": certificate_url,
 		"certificate_id": generate_numeric_id(8),
@@ -681,11 +696,12 @@ async def update_student(
 ):
 	try:
 		roll_no = _normalize_key(roll_no)
-		existing = await students_collections.find_one({"roll_no": roll_no})
+		# Roll numbers are only unique within an institution, so scope the lookup.
+		existing = await students_collections.find_one(
+			{"roll_no": roll_no, "institution_id": principal.get("institution_id")}
+		)
 		if existing is None:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
-		if existing.get("institution_id") != principal.get("institution_id"):
-			raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized for this student")
 
 		updates = student.model_dump(exclude_unset=True)
 		if not updates:
@@ -700,6 +716,7 @@ async def update_student(
 			new_batch_year = updates.get("batch_year", existing.get("batch_year"))
 			clash = await students_collections.find_one(
 				{
+					"institution_id": existing.get("institution_id"),
 					"roll_no": new_roll_no,
 					"batch_year": new_batch_year,
 					"student_id": {"$ne": existing.get("student_id")},
@@ -712,14 +729,13 @@ async def update_student(
 				)
 
 		result = await students_collections.update_one(
-			{"roll_no": roll_no},
+			{"student_id": existing["student_id"]},
 			{"$set": updates},
 		)
 		if result.matched_count == 0:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
 
-		updated_roll_no = updates.get("roll_no", roll_no)
-		document = await students_collections.find_one({"roll_no": updated_roll_no})
+		document = await students_collections.find_one({"student_id": existing["student_id"]})
 		return get_single_document(document)
 	except HTTPException:
 		raise
@@ -731,13 +747,14 @@ async def update_student(
 async def delete_student(roll_no: str, principal: dict = Depends(get_current_principal)):
 	try:
 		roll_no = _normalize_key(roll_no)
-		existing = await students_collections.find_one({"roll_no": roll_no})
+		# Roll numbers are only unique within an institution, so scope the lookup.
+		existing = await students_collections.find_one(
+			{"roll_no": roll_no, "institution_id": principal.get("institution_id")}
+		)
 		if existing is None:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
-		if existing.get("institution_id") != principal.get("institution_id"):
-			raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized for this student")
 
-		result = await students_collections.delete_one({"roll_no": roll_no})
+		result = await students_collections.delete_one({"student_id": existing["student_id"]})
 		if result.deleted_count == 0:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
 	except HTTPException:
