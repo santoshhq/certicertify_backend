@@ -18,7 +18,7 @@ from models.institutions_model import (
 from schemas.institutions_schemas import get_all_documents, get_single_document
 from schemas.students_schemas import get_single_document as get_single_student_document
 from services.email_service import institution_account_verify, institution_password_reset
-from services.aws_s3 import upload_student_certificate
+from services.ftps_storage import delete_certificate_by_url, upload_student_certificate
 from routers.superadmin_routers import _read_replacement_certificate
 from utils.jwt_token_auth import create_access_token, get_current_institution,get_current_superadmin
 
@@ -271,10 +271,14 @@ async def institution_replace_student_certificate(
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
 
 		await _read_replacement_certificate(certificate)
+		old_certificate_url = existing.get("certificate_url")
 		certificate_url = upload_student_certificate(
 			certificate,
 			existing.get("institution_name", ""),
+			existing.get("batch_year", ""),
+			existing.get("course_or_Acadamic", ""),
 			student_key,
+			replacing_url=old_certificate_url,
 		)
 		result = await students_collections.update_one(
 			{"student_id": existing["student_id"], "institution_id": principal.get("institution_id")},
@@ -282,6 +286,8 @@ async def institution_replace_student_certificate(
 		)
 		if result.matched_count == 0:
 			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+		if old_certificate_url != certificate_url:
+			delete_certificate_by_url(old_certificate_url)
 
 		document = await students_collections.find_one({"student_id": existing["student_id"]})
 		return get_single_student_document(document)

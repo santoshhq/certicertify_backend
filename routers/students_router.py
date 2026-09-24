@@ -12,7 +12,7 @@ from openpyxl import load_workbook
 from config.db_collections import institutions_collection, students_collections
 from models.students_models import UpdateStudents
 from schemas.students_schemas import get_all_documents, get_single_document
-from services.aws_s3 import upload_student_certificate
+from services.ftps_storage import upload_student_certificate
 from utils.jwt_token_auth import get_current_principal
 from utils.generate_ids import generate_numeric_id
 
@@ -24,7 +24,7 @@ ALLOWED_CERTIFICATE_EXTENSIONS = {"pdf", "jpg", "jpeg"}
 
 
 class _CertificateFile:
-	"""Duck-types the parts of UploadFile that services.aws_s3.upload_student_certificate reads."""
+	"""Duck-types the parts of UploadFile that services.ftps_storage.upload_student_certificate reads."""
 
 	def __init__(self, filename: str, content: bytes, content_type: str | None = None):
 		self.filename = filename
@@ -302,7 +302,9 @@ async def upload_students(
 				continue
 
 			try:
-				certificate_url = upload_student_certificate(certificate, institution_name, roll_no)
+				certificate_url = upload_student_certificate(
+					certificate, institution_name, batch_year, row_data["course_or_Acadamic"], roll_no
+				)
 				matched_identifiers.add(matched_identifier)
 			except HTTPException as error:
 				errors.append({"row": row_index, "reason": f"Certificate upload failed: {error.detail}, not added"})
@@ -429,7 +431,9 @@ async def create_single_student(
 			),
 		)
 
-	certificate_url = upload_student_certificate(certificate, institution_name, roll_no)
+	certificate_url = upload_student_certificate(
+		certificate, institution_name, batch_year, course_or_Acadamic, roll_no
+	)
 	document = {
 		"student_id": str(uuid4()),
 		"institution_id": institution_id,
