@@ -158,7 +158,9 @@ GET    /superadmin/students/institution/{institution_name}/year/{year}
 GET    /superadmin/students/institution/{institution_name}/batch/{batch_year}
 GET    /superadmin/students/stats/{institution_id}
 GET    /superadmin/students/{roll_no}
-PATCH  /superadmin/students/{roll_no}/certificate   (multipart form)
+PATCH  /superadmin/students/id/{student_id}/certificate   (multipart form)
+PATCH  /superadmin/students/{roll_no}/certificate   (multipart form; optional
+       query ?batch_year=&institution_id= - 409 if the roll_no matches >1 student)
 PATCH  /superadmin/students/{roll_no}
 DELETE /superadmin/students/{roll_no}
 
@@ -266,8 +268,18 @@ PATCH /admin/students/{roll_no}/certificate
   Content-Type: multipart/form-data
   Form fields: certificate: file (.pdf/.jpg/.jpeg, max size env
     CERTIFICATE_MAX_SIZE_MB, default 10MB)
+  Query (optional): batch_year, institution_id - needed when the same
+    roll_no exists in several institutions / batch years.
   Response: updated student document (new certificate_url).
-  Errors: 404 student not found, 400 invalid file / too large / empty.
+  Storage: new file uploaded to cPanel FTPS (compressed to ~150KB if
+    > 200KB) at institutions/<institution>/<batch_year>/<course>/<file>;
+    the previous certificate file is deleted.
+  Errors: 404 student not found, 409 roll_no matches more than one
+    student, 400 invalid file / too large / empty.
+
+PATCH /admin/students/id/{student_id}/certificate
+  Same as above, but targets exactly one student by student_id
+  (recommended - never ambiguous).
 
 PATCH /admin/students/{roll_no}
   Auth: admin + permission "students_update"
@@ -361,8 +373,14 @@ PATCH /institutions/students/{roll_no}/certificate
   Auth: institution (self - scoped to own institution_id)
   Content-Type: multipart/form-data
   Form fields: certificate: file (.pdf/.jpg/.jpeg, size-limited)
-  Response: updated student document.
-  Errors: 404 if student not found under this institution.
+  Query (optional): batch_year - needed when the roll_no exists in
+    several batch years (otherwise 409).
+  Response: updated student document. Old certificate file is deleted.
+  Errors: 404 if student not found under this institution, 409 ambiguous.
+
+PATCH /institutions/students/id/{student_id}/certificate
+  Same as above, but targets exactly one student by student_id
+  (recommended). 404 if the student belongs to another institution.
 
   NOTE: institutions do NOT have their own routes for listing/creating/
   updating/deleting students under the /institutions prefix - for those

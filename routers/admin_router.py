@@ -7,8 +7,7 @@ from schemas.students_schemas import get_all_documents as get_all_student_docume
 from fastapi import APIRouter, File, Form, HTTPException, Depends, UploadFile, status
 from utils.jwt_token_auth import get_current_admin, create_access_token
 from routers.students_router import upload_students, create_single_student
-from services.ftps_storage import delete_certificate_by_url, upload_student_certificate
-from routers.superadmin_routers import _read_replacement_certificate
+from services.certificate_replace import find_student_for_replace, replace_student_certificate
 
 
 admin_routers=APIRouter(prefix="/admin",tags=["Admin"])
@@ -322,38 +321,40 @@ async def admin_get_student(
         raise _internal_server_error(error) from error
 
 
+@admin_routers.patch("/students/id/{student_id}/certificate", status_code=status.HTTP_200_OK)
+async def admin_replace_certificate_by_student_id(
+    student_id: str,
+    certificate: UploadFile = File(...),
+    current_admin: dict = Depends(require_permission("students_update")),
+):
+    """Replace one specific student's certificate (old file is deleted from storage)."""
+    try:
+        existing = await find_student_for_replace({"student_id": student_id})
+        document = await replace_student_certificate(existing, certificate)
+        return get_single_student_document(document)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise _internal_server_error(error) from error
+
+
 @admin_routers.patch("/students/{roll_no}/certificate", status_code=status.HTTP_200_OK)
 async def admin_replace_student_certificate(
     roll_no: str,
     certificate: UploadFile = File(...),
+    batch_year: str | None = None,
+    institution_id: str | None = None,
     current_admin: dict = Depends(require_permission("students_update")),
 ):
+    """Replace by roll number; pass batch_year / institution_id when the roll number is not unique."""
     try:
-        student_key = _student_key(roll_no)
-        existing = await students_collections.find_one({"roll_no": student_key})
-        if existing is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
-
-        await _read_replacement_certificate(certificate)
-        old_certificate_url = existing.get("certificate_url")
-        certificate_url = upload_student_certificate(
-            certificate,
-            existing.get("institution_name", ""),
-            existing.get("batch_year", ""),
-            existing.get("course_or_Acadamic", ""),
-            student_key,
-            replacing_url=old_certificate_url,
-        )
-        result = await students_collections.update_one(
-            {"student_id": existing["student_id"]},
-            {"$set": {"certificate_url": certificate_url}},
-        )
-        if result.matched_count == 0:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
-        if old_certificate_url != certificate_url:
-            delete_certificate_by_url(old_certificate_url)
-
-        document = await students_collections.find_one({"student_id": existing["student_id"]})
+        query = {"roll_no": _student_key(roll_no)}
+        if batch_year:
+            query["batch_year"] = _student_key(batch_year)
+        if institution_id:
+            query["institution_id"] = institution_id
+        existing = await find_student_for_replace(query)
+        document = await replace_student_certificate(existing, certificate)
         return get_single_student_document(document)
     except HTTPException:
         raise

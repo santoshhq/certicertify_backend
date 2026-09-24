@@ -20,7 +20,7 @@ from schemas.superadmin_schemas import single_document,profile_info
 from schemas.institutions_schemas import get_all_documents, get_single_document
 from schemas.admin_schemas import get_all_admin_doc, single_admin_doc
 from services.email_service import admin_account_created, institution_email_changed, superadmin_account_verify, superadmin_password_reset
-from services.ftps_storage import delete_certificate_by_url, upload_student_certificate
+from services.certificate_replace import find_student_for_replace, replace_student_certificate
 from utils.jwt_token_auth import create_access_token, get_current_superadmin
 from models.institutions_model import InstitutionStatus, UpdateBase
 from config.db_collections import admins_collection
@@ -528,34 +528,6 @@ def _student_key(value: str) -> str:
 	return " ".join(str(value).strip().upper().split())
 
 
-def _certificate_max_size_bytes() -> int:
-	try:
-		max_size_mb = int(os.getenv("CERTIFICATE_MAX_SIZE_MB", "10"))
-	except ValueError:
-		max_size_mb = 10
-	return max(max_size_mb, 1) * 1024 * 1024
-
-
-async def _read_replacement_certificate(certificate: UploadFile) -> None:
-	filename = certificate.filename or ""
-	if not filename:
-		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Certificate file is required")
-	if Path(filename).name != filename:
-		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid certificate filename")
-
-	extension = Path(filename).suffix.lower()
-	if extension not in {".pdf", ".jpg", ".jpeg"}:
-		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only PDF, JPG and JPEG certificates are allowed")
-
-	max_size_bytes = _certificate_max_size_bytes()
-	content = await certificate.read(max_size_bytes + 1)
-	if not content:
-		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Certificate file cannot be empty")
-	if len(content) > max_size_bytes:
-		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Certificate file exceeds the maximum allowed size")
-	certificate.file.seek(0)
-
-
 @superadmin_router.get("/students/institution/{institution_name}")
 async def superadmin_get_students_by_institution(
 	institution_name: str,
@@ -661,39 +633,41 @@ async def superadmin_get_student(
 		raise _internal_server_error(error) from error
 
 
+@superadmin_router.patch("/students/id/{student_id}/certificate", status_code=status.HTTP_200_OK)
+async def superadmin_replace_certificate_by_student_id(
+	student_id: str,
+	certificate: UploadFile = File(...),
+	current_superadmin: dict = Depends(get_current_superadmin),
+):
+	"""Replace one specific student's certificate (old file is deleted from storage)."""
+	try:
+		existing = await find_student_for_replace({"student_id": student_id})
+		document = await replace_student_certificate(existing, certificate)
+		return get_single_student_document(document)
+	except HTTPException:
+		raise
+	except Exception as error:
+		raise _internal_server_error(error) from error
+
+
 @superadmin_router.patch("/students/{roll_no}/certificate", status_code=status.HTTP_200_OK)
 async def superadmin_replace_student_certificate(
 	roll_no: str,
 	certificate: UploadFile = File(...),
+	batch_year: str | None = None,
+	institution_id: str | None = None,
 	current_superadmin: dict = Depends(get_current_superadmin),
 ):
+	"""Replace by roll number; pass batch_year / institution_id when the roll number is not unique."""
 	try:
-		student_key = _student_key(roll_no)
-		existing = await students_collections.find_one({"roll_no": student_key})
-		if existing is None:
-			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
-
-		await _read_replacement_certificate(certificate)
-		old_certificate_url = existing.get("certificate_url")
-		certificate_url = upload_student_certificate(
-			certificate,
-			existing.get("institution_name", ""),
-			existing.get("batch_year", ""),
-			existing.get("course_or_Acadamic", ""),
-			student_key,
-			replacing_url=old_certificate_url,
-		)
-		result = await students_collections.update_one(
-			{"student_id": existing["student_id"]},
-			{"$set": {"certificate_url": certificate_url}},
-		)
-		if result.matched_count == 0:
-			raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
-		if old_certificate_url != certificate_url:
-			delete_certificate_by_url(old_certificate_url)
-
-		updated_student = await students_collections.find_one({"student_id": existing["student_id"]})
-		return get_single_student_document(updated_student)
+		query = {"roll_no": _student_key(roll_no)}
+		if batch_year:
+			query["batch_year"] = _student_key(batch_year)
+		if institution_id:
+			query["institution_id"] = institution_id
+		existing = await find_student_for_replace(query)
+		document = await replace_student_certificate(existing, certificate)
+		return get_single_student_document(document)
 	except HTTPException:
 		raise
 	except Exception as error:
